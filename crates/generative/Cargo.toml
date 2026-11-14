@@ -1,0 +1,11 @@
+[package]
+name = "solidcraft-generative"
+description = "SolidCraft generative design: voxel finite elements, topology optimisation and truss layout for load-bearing parts"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]

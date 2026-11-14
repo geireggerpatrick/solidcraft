@@ -5924,6 +5924,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "solidcraft-generative"
+version = "0.42.0"
+
+[[package]]
 name = "solidcraft-geom"
 version = "0.42.0"
 dependencies = [
