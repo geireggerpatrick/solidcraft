@@ -17,7 +17,8 @@
     "+Y": "+Y",
     "-Y": "-Y",
     "+Z": "+Z",
-    "-Z": "-Z"
+    "-Z": "-Z",
+    "generative.done": "تم حساب التصميم التوليدي على {solver} في {seconds} ث: {stress} من {allowed} ميغاباسكال مسموح بها، انحراف {deflection} مم"
   },
   "de": {
     "cmd.generative_design": "Generatives Design",
@@ -37,7 +38,8 @@
     "+Y": "+Y",
     "-Y": "-Y",
     "+Z": "+Z",
-    "-Z": "-Z"
+    "-Z": "-Z",
+    "generative.done": "Generatives Design auf {solver} in {seconds} s berechnet: {stress} von {allowed} MPa erlaubt, {deflection} mm Durchbiegung"
   },
   "en": {
     "cmd.generative_design": "Generative Design",
@@ -57,7 +59,8 @@
     "+Y": "+Y",
     "-Y": "-Y",
     "+Z": "+Z",
-    "-Z": "-Z"
+    "-Z": "-Z",
+    "generative.done": "Generative design computed on {solver} in {seconds} s: {stress} of {allowed} MPa allowed, {deflection} mm deflection"
   },
   "he": {
     "cmd.generative_design": "תכנון גנרטיבי",
@@ -77,7 +80,8 @@
     "+Y": "+Y",
     "-Y": "-Y",
     "+Z": "+Z",
-    "-Z": "-Z"
+    "-Z": "-Z",
+    "generative.done": "התכנון הגנרטיבי חושב על {solver} בתוך {seconds} שניות: {stress} מתוך {allowed} MPa מותרים, שקיעה {deflection} מ״מ"
   },
   "ja": {
     "cmd.generative_design": "ジェネレーティブデザイン",
@@ -97,7 +101,8 @@
     "+Y": "+Y",
     "-Y": "-Y",
     "+Z": "+Z",
-    "-Z": "-Z"
+    "-Z": "-Z",
+    "generative.done": "ジェネレーティブデザインを {solver} で {seconds} 秒で計算しました: 許容 {allowed} MPa のうち {stress} MPa、たわみ {deflection} mm"
   },
   "ko": {
     "cmd.generative_design": "제너레이티브 디자인",
@@ -117,7 +122,8 @@
     "+Y": "+Y",
     "-Y": "-Y",
     "+Z": "+Z",
-    "-Z": "-Z"
+    "-Z": "-Z",
+    "generative.done": "{solver}에서 {seconds}초 만에 제너레이티브 디자인을 계산했습니다: 허용 {allowed} MPa 중 {stress} MPa, 처짐 {deflection} mm"
   },
   "vi": {
     "cmd.generative_design": "Thiết kế tạo sinh",
@@ -137,7 +143,8 @@
     "+Y": "+Y",
     "-Y": "-Y",
     "+Z": "+Z",
-    "-Z": "-Z"
+    "-Z": "-Z",
+    "generative.done": "Đã tính thiết kế tạo sinh trên {solver} trong {seconds} giây: {stress} trên {allowed} MPa cho phép, độ võng {deflection} mm"
   },
   "zh": {
     "cmd.generative_design": "创成式设计",
@@ -157,6 +164,7 @@
     "+Y": "+Y",
     "-Y": "-Y",
     "+Z": "+Z",
-    "-Z": "-Z"
+    "-Z": "-Z",
+    "generative.done": "已在 {solver} 上用 {seconds} 秒算出创成式设计：应力 {stress} MPa（允许 {allowed} MPa），挠度 {deflection} mm"
   }
 }

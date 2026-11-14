@@ -466,7 +466,7 @@ fn control_role(command: &str, label: &str) -> Option<egui::accesskit::Role> {
     Some(match label {
         "Type" if matches!(command, "sheet.flange" | "sheet.hem" | "solid.revolve" | "solid.emboss" | "solid.scale") => return None,
         "Direction" => return None, // segmented buttons, labelled by each choice
-        "Style" | "Detail" if command == "generative.design" => return None, // segmented buttons
+        "Style" | "Detail" if command == "generative.design" => return None,
         "ui.fair_strength" | "ui.fair_iterations" => return None,
         "Size" if matches!(command, "solid.cylinder" | "solid.sphere") => return None, // Diameter | Radius
         "Continuity" | "Corners" | "Cells" | "Profile" => return None,

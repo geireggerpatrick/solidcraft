@@ -685,13 +685,31 @@ fn adopt_dialog(app: &mut SolveApp, prepared: solidcraft_engine::ComputedCommand
     let made = crate::hole_place::holes_made(&replies);
     for (id, reply) in replies {
         let stop = (id == "joint.drive").then(|| crate::dialogs_assembly::drive_stop(&reply)).flatten();
+        let designed = (id == "generative.design").then(|| generative_summary(&reply)).flatten();
         app.command_completed(&id, Ok(reply))?;
-        if let Some(why) = stop {
+        if let Some(why) = stop.or(designed) {
             app.set_status(why, false);
         }
     }
     crate::hole_place::group_made(app, d, made);
     Ok(())
+}
+
+/// What a generative design's reply says about the structure, for the status line: what
+/// computed it, how long it took and what it carries.
+fn generative_summary(reply: &Value) -> Option<String> {
+    let design = reply.get("design")?;
+    let number = |key: &str, digits: usize| design.get(key).and_then(Value::as_f64).map(|v| format!("{v:.digits$}"));
+    Some(solidcraft_ui_text::format(
+        "generative.done",
+        &[
+            ("solver", design.get("solver")?.as_str()?),
+            ("seconds", &number("seconds", 0)?),
+            ("stress", &number("stress", 1)?),
+            ("allowed", &number("allowed", 1)?),
+            ("deflection", &number("deflection", 2)?),
+        ],
+    ))
 }
 
 /// A complete feature transaction, evaluated without changing the displayed session.

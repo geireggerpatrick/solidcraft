@@ -2,8 +2,9 @@
 //! feature reply, [`super::features::FeatureResult`].
 
 use schemars::JsonSchema;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
+use super::features::FeatureResult;
 use super::types::{Point3, StringList};
 
 /// A face, by its body and a point on it.
@@ -70,4 +71,34 @@ pub struct GenerativeDesignParams {
     /// The new body's name. Default: `Generative`.
     #[serde(default)]
     pub body_name: Option<String>,
+}
+
+/// What a generative design returns: the feature it added and how the structure fared.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct GenerativeDesignResult {
+    #[serde(flatten)]
+    pub feature: FeatureResult,
+    /// How the structure was computed and what it carries.
+    pub design: GenerativeDesignReport,
+}
+
+/// How a generative design was computed and what the structure carries.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct GenerativeDesignReport {
+    /// What solved the equations: the graphics card's name, or `CPU`.
+    pub solver: String,
+    /// How long the computation took, in seconds.
+    pub seconds: f64,
+    /// The cells of the grid the structure was computed on.
+    pub cells: u64,
+    /// A cell's size in mm.
+    pub cell: f64,
+    /// The highest stress in the structure, in MPa.
+    pub stress: f64,
+    /// The stress the material and the safety factor allow, in MPa.
+    pub allowed: f64,
+    /// How far the loaded faces move under the force, in mm.
+    pub deflection: f64,
+    /// Whether the structure carries the force within the stress allowed.
+    pub passed: bool,
 }

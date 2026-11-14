@@ -8,8 +8,7 @@ use solidcraft_generative::study::{self, Report, Study};
 use solidcraft_generative::voxel::{self as gv, Settings, Style, V3};
 
 use super::{CommandSpec, face::face_at_state, features::add_feature};
-use crate::schema::features::FeatureResult;
-use crate::schema::generative::{GenerativeDesignParams, GenerativeFace};
+use crate::schema::generative::{GenerativeDesignParams, GenerativeDesignReport, GenerativeDesignResult, GenerativeFace};
 use crate::schema::{TypedContract, output_schema_for};
 use crate::{Result, Session, params::bad};
 
@@ -20,7 +19,7 @@ pub static COMMANDS: &[CommandSpec] = &[
     CommandSpec::new("generative.design", "Generative Design", crate::checked!("generative.design", design))
         .icon("import")
         .contract(&DESIGN_CONTRACT)
-        .output(output_schema_for::<FeatureResult>)
+        .output(output_schema_for::<GenerativeDesignResult>)
         .params("held: [{body, point: [x,y,z]}] (faces that are held); load: [{body, point: [x,y,z]}] (faces the force acts on); force: [x,y,z] in newtons; style?: organic|tree|lattice (default organic); space?: body to carve the structure out of (default: the box around the picked faces, around the bodies they belong to, which stay as they are); avoid?: [body] (further bodies to stay clear of); margin?: mm the design box reaches beyond the faces; strength?: MPa (default 35); modulus?: MPa (default 1900); safety?: 1…20 (default 2); voxels?: 500…2000000 cells (default 40000); wall?: thinnest strut in mm (default: 4 % of the design space's longest side); deflection?: the most the loaded faces may move, in mm (default: 1/400 of the design space's longest side); name?; body_name? (default Generative): a new mesh body that carries the force from the loaded to the held faces with as little material as the strength allows"),
 ];
 
@@ -142,7 +141,19 @@ fn design(s: &mut Session, p: &Value) -> Result<Value> {
             accelerate: true,
         },
     };
-    let Report { mesh, outcome, .. } = study::run(&study, &mut || true).map_err(|e| bad(CMD, e))?;
+    let began = web_time::Instant::now();
+    let Report { mesh, outcome, cell, cells } = study::run(&study, &mut || true).map_err(|e| bad(CMD, e))?;
+    // A graphics card that failed on the way was dropped, and the CPU finished the work.
+    let report = GenerativeDesignReport {
+        solver: gv::grid_solver_name().unwrap_or_else(|| "CPU".into()),
+        seconds: began.elapsed().as_secs_f64(),
+        cells: cells as u64,
+        cell,
+        stress: outcome.stress,
+        allowed: outcome.allowed,
+        deflection: outcome.deflection,
+        passed: outcome.passed,
+    };
     if mesh.pos.len() > u32::MAX as usize {
         return Err(bad(CMD, "the result has too many triangles; give fewer `voxels`"));
     }
@@ -155,14 +166,15 @@ fn design(s: &mut Session, p: &Value) -> Result<Value> {
         color: None,
     };
     let mut reply = add_feature(s, p, FeatureKind::MeshImport { file: "generative design".into(), meshes: vec![data] })?;
-    if !outcome.passed
-        && let Some(o) = reply.as_object_mut()
-    {
-        let text = format!(
-            "the structure reaches {:.1} MPa where {:.1} MPa are allowed; give it more room, a stronger material or a smaller force",
-            outcome.stress, outcome.allowed
-        );
-        o.insert("warning".into(), Value::String(text));
+    if let Some(o) = reply.as_object_mut() {
+        if !outcome.passed {
+            let text = format!(
+                "the structure reaches {:.1} MPa where {:.1} MPa are allowed; give it more room, a stronger material or a smaller force",
+                outcome.stress, outcome.allowed
+            );
+            o.insert("warning".into(), Value::String(text));
+        }
+        o.insert("design".into(), serde_json::to_value(&report).map_err(|e| bad(CMD, e.to_string()))?);
     }
     Ok(reply)
 }
