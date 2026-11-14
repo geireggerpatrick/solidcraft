@@ -1233,35 +1233,44 @@ fn check_binary(p: &Problem, brick: &Brick, mask: &[bool], s: &Settings, u: &mut
     Check { stress, deflection: fem.load_displacement(u), connected }
 }
 
-/// Box blur of a 0/1 mask, kept inside the design space, as a smooth field.
+/// A 0/1 mask as a smooth field whose 0.5 level is the surface: blurred twice, so the steps of
+/// the voxels do not show, but never across 0.5, so thin members stay and holes stay open.
 fn smooth(g: &Grid, x: &[f64], keep: &[bool]) -> Vec<f64> {
-    let mut out = vec![0.0; g.len()];
-    let mut nb = Vec::new();
-    for v in 0..g.len() {
-        if !g.inside[v] {
-            continue;
-        }
-        g.neighbours(v, &mut nb);
-        let mut sum = 2.0 * x[v];
-        let mut w = 2.0;
-        for &(n, d) in &nb {
-            if d < 1.5 {
-                let wt = if d < 1.01 { 1.0 } else { 0.5 };
-                sum += wt * if g.inside[n] { x[n] } else { 0.0 };
-                w += wt;
+    let blur = |x: &[f64]| -> Vec<f64> {
+        let mut out = vec![0.0; g.len()];
+        let mut nb = Vec::new();
+        for v in 0..g.len() {
+            if !g.inside[v] {
+                continue;
             }
+            g.neighbours(v, &mut nb);
+            let mut sum = 2.0 * x[v];
+            let mut w = 2.0;
+            for &(n, d) in &nb {
+                if d < 1.5 {
+                    let wt = if d < 1.01 { 1.0 } else { 0.5 };
+                    sum += wt * if g.inside[n] { x[n] } else { 0.0 };
+                    w += wt;
+                }
+            }
+            out[v] = sum / w;
         }
-        // Blur for smooth surfaces, but never across 0.5: thin members stay, holes stay open.
-        let b = sum / w;
-        out[v] = if keep[v] {
-            1.0
-        } else if x[v] > 0.5 {
-            0.6 + 0.4 * b
-        } else {
-            0.45 * b
-        };
-    }
-    out
+        out
+    };
+    let b = blur(&blur(x));
+    (0..g.len())
+        .map(|v| {
+            if !g.inside[v] {
+                0.0
+            } else if keep[v] {
+                1.0
+            } else if x[v] > 0.5 {
+                b[v].max(0.56)
+            } else {
+                b[v].min(0.44)
+            }
+        })
+        .collect()
 }
 
 /// Fills voxels so that no 2x2x2 block has solid (or empty) voxels touching only at an edge
@@ -1913,7 +1922,7 @@ pub fn surface(g: &Grid, field: &[f64], up: usize, smooth_iters: usize, cuts: &[
             }
         }
     }
-    taubin(&mut mesh, smooth_iters);
+    taubin(&mut mesh, smooth_iters, within, 0.05 * g.h);
     // Holes back to their exact radius, and nothing outside the design space's box.
     for p in &mut mesh.pos {
         for (o, ax, r) in cuts {
@@ -1933,8 +1942,16 @@ pub fn surface(g: &Grid, field: &[f64], up: usize, smooth_iters: usize, cuts: &[
 }
 
 /// Taubin smoothing: shrink-free Laplacian smoothing.
-fn taubin(m: &mut Mesh, iters: usize) {
+/// Smooths without shrinking. A vertex that lies on one of the planes (within `near`) stays
+/// on it: the flat ends of a structure stay flat.
+fn taubin(m: &mut Mesh, iters: usize, planes: &[HalfSpace], near: f64) {
     let n = m.pos.len();
+    let planes: Vec<HalfSpace> = planes.iter().map(|(p, d)| (*p, unit(*d))).collect();
+    let on: Vec<Vec<usize>> = if planes.is_empty() {
+        Vec::new()
+    } else {
+        m.pos.iter().map(|p| (0..planes.len()).filter(|&i| dot(sub(*p, planes[i].0), planes[i].1).abs() <= near).collect()).collect()
+    };
     let mut adj: Vec<Vec<usize>> = vec![Vec::new(); n];
     for t in &m.tri {
         for (a, b) in [(t[0], t[1]), (t[1], t[2]), (t[2], t[0])] {
@@ -1961,6 +1978,12 @@ fn taubin(m: &mut Mesh, iters: usize) {
                 }
                 for a in 0..3 {
                     m.pos[v][a] = old[v][a] + f * (c[a] - old[v][a]);
+                }
+                for &i in on.get(v).map_or(&[][..], |l| l) {
+                    let off = dot(sub(m.pos[v], planes[i].0), planes[i].1);
+                    for a in 0..3 {
+                        m.pos[v][a] -= off * planes[i].1[a];
+                    }
                 }
             }
         }

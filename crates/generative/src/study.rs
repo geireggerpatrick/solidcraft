@@ -271,7 +271,7 @@ pub fn run(study: &Study, time_left: &mut dyn FnMut() -> bool) -> Result<Report,
         }
     }
     let up = if g.len() > 400_000 { 1 } else { 2 };
-    let mesh = gv::surface(g, &field, up, 10, &[], clip, &within);
+    let mesh = gv::surface(g, &field, up, 40, &[], clip, &within);
     // Loose crumbs carry nothing: only pieces that stand on a held face stay.
     let held_planes: Vec<HalfSpace> = held.iter().filter_map(|f| f.plane).collect();
     let mesh = if held_planes.len() == held.len() { standing(mesh, &held_planes) } else { mesh };
