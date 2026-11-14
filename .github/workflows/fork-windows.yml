@@ -1,0 +1,45 @@
+# A test build for Windows x64 from this fork's generative-design work: the portable zip
+# (solidcraft.exe + solidcraft-cli.exe), unsigned, as a workflow artifact. Unzip it anywhere and
+# run it beside an installed SolidCraft. Not a release: nothing is published.
+name: Fork Windows test build
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [generative-design]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fork-windows-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  windows:
+    name: Windows x64
+    runs-on: windows-latest
+    timeout-minutes: 120
+    env:
+      SOLIDCRAFT_VERSION: 0.42.0-generative
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@1.99.1
+        with:
+          targets: x86_64-pc-windows-msvc
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: fork-windows-x64
+      - name: Install WiX
+        shell: pwsh
+        run: |
+          dotnet tool install --global wix --version 5.0.2
+          wix extension add -g WixToolset.UI.wixext/5.0.2 WixToolset.Util.wixext/5.0.2
+      - name: Build and package
+        shell: pwsh
+        run: ./packaging/windows/package.ps1 -Arch x64
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: solidcraft-generative-windows-x64
+          path: dist/release/*portable.zip
+          if-no-files-found: error
