@@ -6,7 +6,7 @@ name: Fork Windows test build
 on:
   workflow_dispatch:
   push:
-    branches: [generative-design]
+    branches: ['generative-design*']
 
 permissions:
   contents: read
@@ -19,7 +19,7 @@ jobs:
   windows:
     name: Windows x64
     runs-on: windows-latest
-    timeout-minutes: 120
+    timeout-minutes: 180
     env:
       SOLIDCRAFT_VERSION: 0.42.0-generative
     steps:
