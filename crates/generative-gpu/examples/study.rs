@@ -1,5 +1,5 @@
 //! Runs a small study and writes the structure as an STL file, to look at a change quickly:
-//! `cargo run --release -p solidcraft-generative-gpu --example study -- shelf out.stl [voxels] [style] [newtons] [wall] [cpu|gpu|any]`.
+//! `cargo run --release -p solidcraft-generative-gpu --example study -- shelf out.stl [voxels] [style] [newtons] [wall] [cpu|gpu|any] [deflection]`.
 //! `gpu` (the default) computes on a hardware adapter when there is one, `any` also on a software
 //! adapter, `cpu` never on an adapter.
 
@@ -39,30 +39,44 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
     }
-    let (held, load, obstacles): (Vec<[V3; 3]>, Vec<[V3; 3]>, Vec<Mesh>) = match case {
+    let deflection: f64 = args.get(8).and_then(|v| v.parse().ok()).unwrap_or(0.0);
+    let mut force = [0.0, 0.0, -newtons];
+    let (held, load, obstacles): (Vec<Vec<[V3; 3]>>, Vec<Vec<[V3; 3]>>, Vec<Mesh>) = match case {
+        // A plate held above five feet spread out below it, each pushed upwards.
+        "bracket" => {
+            force = [0.0, 0.0, newtons];
+            let feet = [[-120.0, -40.0], [-80.0, 45.0], [0.0, 70.0], [80.0, 45.0], [120.0, -40.0]];
+            let mut bodies = vec![box_mesh([-30.0, -25.0, 90.0], [30.0, 25.0, 98.0])];
+            let mut load = Vec::new();
+            for [x, y] in feet {
+                bodies.push(box_mesh([x - 8.0, y - 8.0, 0.0], [x + 8.0, y + 8.0, 10.0]));
+                load.push(quad([x - 8.0, y - 8.0, 10.0], [x + 8.0, y - 8.0, 10.0], [x + 8.0, y + 8.0, 10.0], [x - 8.0, y + 8.0, 10.0]));
+            }
+            (vec![quad([-30.0, -25.0, 90.0], [-30.0, 25.0, 90.0], [30.0, 25.0, 90.0], [30.0, -25.0, 90.0])], load, bodies)
+        }
         // Two plates facing each other, 115 mm apart.
         "plates" => (
-            quad([5.0, 0.0, 0.0], [5.0, 60.0, 0.0], [5.0, 60.0, 40.0], [5.0, 0.0, 40.0]),
-            quad([120.0, 10.0, 0.0], [120.0, 10.0, 40.0], [120.0, 50.0, 40.0], [120.0, 50.0, 0.0]),
+            vec![quad([5.0, 0.0, 0.0], [5.0, 60.0, 0.0], [5.0, 60.0, 40.0], [5.0, 0.0, 40.0])],
+            vec![quad([120.0, 10.0, 0.0], [120.0, 10.0, 40.0], [120.0, 50.0, 40.0], [120.0, 50.0, 0.0])],
             vec![box_mesh([0.0, 0.0, 0.0], [5.0, 60.0, 40.0]), box_mesh([120.0, 10.0, 0.0], [125.0, 50.0, 40.0])],
         ),
         // A long beam and a small plate 180 mm in front of its side.
         "beam" => (
-            quad([20.0, 0.0, 0.0], [20.0, 400.0, 0.0], [20.0, 400.0, 40.0], [20.0, 0.0, 40.0]),
-            quad([200.0, 250.0, -10.0], [200.0, 250.0, 30.0], [200.0, 330.0, 30.0], [200.0, 330.0, -10.0]),
+            vec![quad([20.0, 0.0, 0.0], [20.0, 400.0, 0.0], [20.0, 400.0, 40.0], [20.0, 0.0, 40.0])],
+            vec![quad([200.0, 250.0, -10.0], [200.0, 250.0, 30.0], [200.0, 330.0, 30.0], [200.0, 330.0, -10.0])],
             vec![box_mesh([0.0, 0.0, 0.0], [20.0, 400.0, 40.0]), box_mesh([200.0, 250.0, -10.0], [210.0, 330.0, 30.0])],
         ),
         // A wall plate and a shelf plate in front of it.
         _ => (
-            quad([5.0, 0.0, 0.0], [5.0, 60.0, 0.0], [5.0, 60.0, 80.0], [5.0, 0.0, 80.0]),
-            quad([30.0, 5.0, 80.0], [30.0, 55.0, 80.0], [100.0, 55.0, 80.0], [100.0, 5.0, 80.0]),
+            vec![quad([5.0, 0.0, 0.0], [5.0, 60.0, 0.0], [5.0, 60.0, 80.0], [5.0, 0.0, 80.0])],
+            vec![quad([30.0, 5.0, 80.0], [30.0, 55.0, 80.0], [100.0, 55.0, 80.0], [100.0, 5.0, 80.0])],
             vec![box_mesh([0.0, 0.0, 0.0], [5.0, 60.0, 80.0]), box_mesh([30.0, 5.0, 80.0], [100.0, 55.0, 85.0])],
         ),
     };
     let study = Study {
-        held: vec![held],
-        load: vec![load],
-        force: [0.0, 0.0, -newtons],
+        held,
+        load,
+        force,
         space: None,
         obstacles,
         margin: 0.0,
@@ -73,7 +87,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             safety: 2.0,
             volume: None,
             min_wall: wall,
-            max_deflection: 0.0,
+            max_deflection: deflection,
             accelerate: true,
         },
     };

@@ -977,17 +977,32 @@ fn additional_rows(app: &mut SolveApp, d: &mut Dialog, ui: &mut egui::Ui) -> boo
         Kind::MeshConvert { tolerance } => {
             form_row(ui, "Tolerance", |ui| enter |= field(ui, tolerance));
         }
-        Kind::Generative { force, direction, style, detail } => {
+        Kind::Generative { force, direction, vector, style, detail, material, strength, modulus, safety, wall, deflection, margin } => {
             form_row(ui, "Force (N)", |ui| enter |= field(ui, force));
             form_row(ui, "Direction", |ui| {
                 ui_kit::segmented(ui, direction, &GENERATIVE_DIRECTIONS.map(|(label, _)| label), Default::default());
             });
+            enter |= hint_row(ui, "Direction (x, y, z)", vector, tr("as chosen above"));
             form_row(ui, "Style", |ui| {
                 ui_kit::segmented(ui, style, &GENERATIVE_STYLES.map(|(label, _)| label), Default::default());
             });
             form_row(ui, "Detail", |ui| {
                 ui_kit::segmented(ui, detail, &GENERATIVE_DETAIL.map(|(label, _)| label), Default::default());
             });
+            let before = *material;
+            choice_row(ui, "Material", "generative_material", material, &GENERATIVE_MATERIALS.map(|(label, ..)| label));
+            if *material != before
+                && let Some((_, s, e)) = GENERATIVE_MATERIALS.get(*material).filter(|m| m.1 > 0.0)
+            {
+                *strength = s.to_string();
+                *modulus = e.to_string();
+            }
+            form_row(ui, "Strength (MPa)", |ui| enter |= field(ui, strength));
+            form_row(ui, "Stiffness (MPa)", |ui| enter |= field(ui, modulus));
+            form_row(ui, "Safety factor", |ui| enter |= field(ui, safety));
+            enter |= hint_row_positive(ui, "Thinnest member (mm)", wall, tr("automatic"));
+            enter |= hint_row_positive(ui, "Largest deflection (mm)", deflection, tr("automatic"));
+            enter |= hint_row_positive(ui, "Room around (mm)", margin, tr("none"));
         }
         Kind::Construct { t: Some(t), .. } => {
             form_row(ui, "Position (0 to 1)", |ui| enter |= field(ui, t));

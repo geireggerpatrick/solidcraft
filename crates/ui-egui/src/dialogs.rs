@@ -261,13 +261,24 @@ crate::dialog_descriptor::dialog_descriptors! {
                 tolerance: String,
             },
             /// A light structure grown between held and loaded faces. `direction` indexes
-            /// [`super::GENERATIVE_DIRECTIONS`], `style` the engine's styles and `detail` the cell
-            /// counts of [`super::GENERATIVE_DETAIL`].
+            /// [`super::GENERATIVE_DIRECTIONS`] unless `vector` gives the force's direction,
+            /// `style` the engine's styles, `detail` the cell counts of
+            /// [`super::GENERATIVE_DETAIL`] and `material` [`super::GENERATIVE_MATERIALS`], which
+            /// fills `strength` and `modulus`. Empty `wall`, `deflection` and `margin` leave the
+            /// engine's defaults.
             Generative {
                 force: String,
                 direction: usize,
+                vector: String,
                 style: usize,
                 detail: usize,
+                material: usize,
+                strength: String,
+                modulus: String,
+                safety: String,
+                wall: String,
+                deflection: String,
+                margin: String,
             },
             /// A construction axis, point or plane made from picks alone (#2474): input `i` is the
             /// command's parameter `keys[i]`, and `t` (along a path) when it takes one.
@@ -1050,8 +1061,26 @@ impl Dialog {
                 vec![SelInput::new("Mesh body", BODIES, false)],
             ),
             "generative.design" => Dialog::new(
-                Kind::Generative { force: "100".into(), direction: 5, style: 0, detail: 1 },
-                vec![SelInput::new("Held faces", FACES, true), SelInput::new("Loaded faces", FACES, true)],
+                Kind::Generative {
+                    force: "100".into(),
+                    direction: 5,
+                    vector: String::new(),
+                    style: 0,
+                    detail: 1,
+                    material: 1,
+                    strength: GENERATIVE_MATERIALS[1].1.to_string(),
+                    modulus: GENERATIVE_MATERIALS[1].2.to_string(),
+                    safety: "2".into(),
+                    wall: String::new(),
+                    deflection: String::new(),
+                    margin: String::new(),
+                },
+                vec![
+                    SelInput::new("Held faces", FACES, true),
+                    SelInput::new("Loaded faces", FACES, true),
+                    SelInput::new("Bodies to avoid", BODIES, true),
+                    SelInput::new("Design space", BODIES, false),
+                ],
             ),
             // Plane, Axis and Point open as the method their picks call for (`dialogs_auto`).
             _ if solidcraft_engine::cmd::is_construct_tool(id) => return auto::start(app, id),
@@ -4581,7 +4610,21 @@ pub(crate) const GENERATIVE_DIRECTIONS: [(&str, [f64; 3]); 6] = [
 /// A generative design's styles: the label and the engine's name.
 pub(crate) const GENERATIVE_STYLES: [(&str, &str); 3] = [("Organic", "organic"), ("Tree", "tree"), ("Lattice", "lattice")];
 /// A generative design's levels of detail: the label and the cells to compute with.
-pub(crate) const GENERATIVE_DETAIL: [(&str, f64); 3] = [("Coarse", 40_000.0), ("Medium", 120_000.0), ("Fine", 400_000.0)];
+pub(crate) const GENERATIVE_DETAIL: [(&str, f64); 4] = [("Coarse", 40_000.0), ("Medium", 120_000.0), ("Fine", 400_000.0), ("Very fine", 1_200_000.0)];
+/// Materials a generative design can be sized for: the label, the strength and the stiffness
+/// (modulus of elasticity) in MPa, as data sheets commonly give them. The last leaves the
+/// fields as typed.
+pub(crate) const GENERATIVE_MATERIALS: [(&str, f64, f64); 9] = [
+    ("PLA", 50.0, 3300.0),
+    ("PETG", 45.0, 2000.0),
+    ("ABS", 40.0, 2200.0),
+    ("ASA", 45.0, 2300.0),
+    ("Nylon (PA12)", 48.0, 1700.0),
+    ("Aluminium", 275.0, 69000.0),
+    ("Steel", 235.0, 210000.0),
+    ("Titanium", 880.0, 114000.0),
+    ("Custom", 0.0, 0.0),
+];
 
 /// Whether two dialog kinds are the same command (a chamfer is not a fillet).
 fn same_command(a: &Kind, b: &Kind) -> bool {
@@ -6052,28 +6095,76 @@ fn dialog_commands(app: &SolveApp, d: &Dialog) -> Result<Vec<(String, Value)>, S
                 None => ("construct.plane.offset", json!({"base": base, "through": null})),
             }
         }
-        Kind::Generative { force, direction, style, detail } => {
+        Kind::Generative { force, direction, vector, style, detail, strength, modulus, safety, wall, deflection, margin, .. } => {
             need(0, "the held faces")?;
             need(1, "the loaded faces")?;
-            let newtons: f64 =
-                force.trim().replace(',', ".").parse().ok().filter(|n: &f64| n.is_finite() && *n > 0.0).ok_or("give the force in newtons")?;
+            // A number as typed, with a decimal comma or point; an empty field is none.
+            let number = |text: &str, what: &str| -> Result<Option<f64>, String> {
+                let text = text.trim();
+                if text.is_empty() {
+                    return Ok(None);
+                }
+                text.replace(',', ".")
+                    .parse()
+                    .ok()
+                    .filter(|n: &f64| n.is_finite() && *n > 0.0)
+                    .map(Some)
+                    .ok_or_else(|| format!("give {what} as a number above zero"))
+            };
+            let newtons = number(force, "the force in newtons")?.ok_or("give the force in newtons")?;
             let faces = |i: usize| -> Vec<Value> {
                 sels(d, i)
                     .iter()
                     .filter_map(|x| if let Sel::Face { body, point, .. } = x { Some(json!({"body": body, "point": pt(*point)})) } else { None })
                     .collect()
             };
-            let axis = GENERATIVE_DIRECTIONS.get(*direction).map_or([0.0, 0.0, -1.0], |(_, v)| *v);
-            (
-                "generative.design",
-                json!({
-                    "held": faces(0),
-                    "load": faces(1),
-                    "force": axis.map(|c| c * newtons),
-                    "style": GENERATIVE_STYLES.get(*style).map_or("organic", |(_, id)| *id),
-                    "voxels": GENERATIVE_DETAIL.get(*detail).map_or(120_000.0, |(_, n)| *n),
-                }),
-            )
+            // The direction typed as three numbers wins over the axis chosen.
+            let axis = if vector.trim().is_empty() {
+                GENERATIVE_DIRECTIONS.get(*direction).map_or([0.0, 0.0, -1.0], |(_, v)| *v)
+            } else {
+                let parts: Vec<f64> = if vector.contains(';') {
+                    vector.split(';').filter_map(|c| c.trim().replace(',', ".").parse().ok()).collect()
+                } else {
+                    vector.split(|c: char| c == ',' || c.is_whitespace()).filter(|c| !c.is_empty()).filter_map(|c| c.parse().ok()).collect()
+                };
+                let length = parts.iter().map(|c| c * c).sum::<f64>().sqrt();
+                if parts.len() != 3 || !(length.is_finite() && length > 1e-9) {
+                    return Err("give the direction as three numbers: x, y, z".into());
+                }
+                [parts[0] / length, parts[1] / length, parts[2] / length]
+            };
+            let mut params = json!({
+                "held": faces(0),
+                "load": faces(1),
+                "force": axis.map(|c| c * newtons),
+                "style": GENERATIVE_STYLES.get(*style).map_or("organic", |(_, id)| *id),
+                "voxels": GENERATIVE_DETAIL.get(*detail).map_or(120_000.0, |(_, n)| *n),
+            });
+            let bodies = |i: usize| -> Vec<String> {
+                sels(d, i).iter().filter_map(|x| if let Sel::Body { name } = x { Some(name.clone()) } else { None }).collect()
+            };
+            if let Some(o) = params.as_object_mut() {
+                for (key, text, what) in [
+                    ("strength", strength, "the strength in MPa"),
+                    ("modulus", modulus, "the stiffness in MPa"),
+                    ("safety", safety, "the safety factor"),
+                    ("wall", wall, "the thinnest member in mm"),
+                    ("deflection", deflection, "the largest deflection in mm"),
+                    ("margin", margin, "the room around in mm"),
+                ] {
+                    if let Some(n) = number(text, what)? {
+                        o.insert(key.into(), json!(n));
+                    }
+                }
+                let avoid = bodies(2);
+                if !avoid.is_empty() {
+                    o.insert("avoid".into(), json!(avoid));
+                }
+                if let Some(space) = bodies(3).into_iter().next() {
+                    o.insert("space".into(), json!(space));
+                }
+            }
+            ("generative.design", params)
         }
         Kind::MeshConvert { tolerance } => {
             need(0, "the mesh body")?;

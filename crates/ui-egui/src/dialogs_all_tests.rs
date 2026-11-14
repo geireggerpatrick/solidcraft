@@ -467,6 +467,7 @@ fn control_role(command: &str, label: &str) -> Option<egui::accesskit::Role> {
         "Type" if matches!(command, "sheet.flange" | "sheet.hem" | "solid.revolve" | "solid.emboss" | "solid.scale") => return None,
         "Direction" => return None, // segmented buttons, labelled by each choice
         "Style" | "Detail" if command == "generative.design" => return None,
+        "Material" if command == "generative.design" => Role::ComboBox,
         "ui.fair_strength" | "ui.fair_iterations" => return None,
         "Size" if matches!(command, "solid.cylinder" | "solid.sphere") => return None, // Diameter | Radius
         "Continuity" | "Corners" | "Cells" | "Profile" => return None,
@@ -642,7 +643,24 @@ form_case!(sweep, "solid.sweep", ["Orientation"]);
 form_case!(offset_plane, "construct.plane.offset", ["Distance"]);
 form_case!(midplane, "construct.plane.midplane", []);
 form_case!(mesh_convert, "mesh.convert", ["Tolerance"]);
-form_case!(generative_design, "generative.design", ["Force (N)", "Direction", "Style", "Detail"]);
+form_case!(
+    generative_design,
+    "generative.design",
+    [
+        "Force (N)",
+        "Direction",
+        "Direction (x, y, z)",
+        "Style",
+        "Detail",
+        "Material",
+        "Strength (MPa)",
+        "Stiffness (MPa)",
+        "Safety factor",
+        "Thinnest member (mm)",
+        "Largest deflection (mm)",
+        "Room around (mm)"
+    ]
+);
 form_case!(axis_two_planes, "construct.axis.two_planes", []);
 form_case!(point_along_path, "construct.point.along_path", ["Position (0 to 1)"]);
 form_case!(angle_plane, "construct.plane.at_angle", ["Angle"]);
