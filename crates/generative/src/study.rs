@@ -167,7 +167,7 @@ pub fn run(study: &Study, time_left: &mut dyn FnMut() -> bool) -> Result<Report,
                 return Err("the picked faces span no space to build in".into());
             }
             for a in 0..3 {
-                let grow = (0.2 * longest - (hi[a] - lo[a])) / 2.0;
+                let grow = (0.3 * longest - (hi[a] - lo[a])) / 2.0;
                 if grow > 0.0 {
                     lo[a] -= grow;
                     hi[a] += grow;
@@ -196,20 +196,53 @@ pub fn run(study: &Study, time_left: &mut dyn FnMut() -> bool) -> Result<Report,
         }
     }
     if boxed {
-        // The layer just behind a flat picked face belongs to the structure: it is what the
-        // cut on the face's plane leaves flat. And nothing is built on the far side of a
-        // picked face's plane.
-        let all = Grid { inside: vec![true; grid.len()], ..grid.clone() };
-        for f in held.iter().chain(&load).filter(|f| f.plane.is_some()) {
-            for v in gv::voxels_near(&all, f.tris, 0.9 * h) {
-                grid.inside[v] = true;
-            }
-        }
+        // Nothing is built on the far side of a picked face's plane.
         for (point, normal) in &within {
             for v in 0..grid.len() {
                 if dot(sub(grid.center(v), *point), *normal) < -0.9 * h {
                     grid.inside[v] = false;
                 }
+            }
+        }
+        // The layer just behind a flat picked face, in its body, belongs to the structure: it
+        // is what the cut on the face's plane leaves flat. Beside the face, that layer and the
+        // one in front of the plane stay empty: the structure meets the plane on the face only
+        // and does not hang over the face's edges.
+        let mut on_face = vec![false; grid.len()];
+        let mut behind = vec![false; grid.len()];
+        let mut beside = vec![false; grid.len()];
+        for f in held.iter().chain(&load) {
+            let Some((point, normal)) = f.plane else { continue };
+            // A face narrower than a cell still gets the cells along it.
+            for reach in [0.3 * h, 0.9 * h] {
+                let mut found = false;
+                for v in 0..grid.len() {
+                    let c = grid.center(v);
+                    let depth = dot(sub(c, point), normal);
+                    if !(depth > -0.9 * h && depth < 1.25 * h) {
+                        continue;
+                    }
+                    let foot = [0, 1, 2].map(|a| c[a] - depth * normal[a]);
+                    if f.tris.iter().any(|t| gv::point_triangle_distance(foot, t) <= reach) {
+                        on_face[v] = true;
+                        if depth < 0.0 {
+                            behind[v] = true;
+                            found = true;
+                        }
+                    } else {
+                        beside[v] = true;
+                    }
+                }
+                if found {
+                    break;
+                }
+            }
+        }
+        for v in 0..grid.len() {
+            if behind[v] {
+                grid.inside[v] = true;
+            } else if beside[v] && !on_face[v] {
+                grid.inside[v] = false;
             }
         }
     }

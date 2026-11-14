@@ -1233,9 +1233,56 @@ fn check_binary(p: &Problem, brick: &Brick, mask: &[bool], s: &Settings, u: &mut
     Check { stress, deflection: fem.load_displacement(u), connected }
 }
 
-/// A 0/1 mask as a smooth field whose 0.5 level is the surface: blurred twice, so the steps of
-/// the voxels do not show, but never across 0.5, so thin members stay and holes stay open.
-fn smooth(g: &Grid, x: &[f64], keep: &[bool]) -> Vec<f64> {
+/// The design without what is too faint to be a member: a solid voxel stays if the soft design
+/// `rho` is clearly solid there (0.7 and up) or in a voxel next to it. Where the soft design only
+/// just passes 0.5, a member is thinner than the cone it is averaged over and would come out as
+/// a string of beads. `keep` voxels always stay.
+fn thick(g: &Grid, mask: &[bool], rho: &[f64], keep: &[bool]) -> Vec<bool> {
+    let strong = |v: usize| g.inside[v] && mask[v] && (keep[v] || rho[v] >= 0.7);
+    let mut nb = Vec::new();
+    (0..g.len())
+        .map(|v| {
+            if !(g.inside[v] && mask[v]) {
+                return false;
+            }
+            if strong(v) {
+                return true;
+            }
+            g.neighbours(v, &mut nb);
+            nb.iter().any(|&(n, _)| strong(n))
+        })
+        .collect()
+}
+
+/// The design as a smooth field whose 0.5 level is the surface. `x` is the 0/1 design. With the
+/// soft design `rho` it was cut from, the field is that: its 0.5 level lies where the design's
+/// edge is between two voxels, so it does not follow the voxels' steps. Without, the 0/1 design
+/// is blurred, but never across 0.5, so thin members stay and holes stay open.
+fn smooth(g: &Grid, x: &[f64], rho: Option<&[f64]>, keep: &[bool]) -> Vec<f64> {
+    let solid = |v: usize| x[v] > 0.5;
+    if let Some(rho) = rho {
+        // Where the design was changed after the cut (crumbs dropped, thin parts taken away,
+        // diagonal gaps filled), the field follows the design.
+        let mut field: Vec<f64> = (0..g.len())
+            .map(|v| {
+                if !g.inside[v] {
+                    0.0
+                } else if solid(v) {
+                    if rho[v] > 0.5 { rho[v] } else { 0.55 }
+                } else if rho[v] < 0.5 {
+                    rho[v]
+                } else {
+                    0.45
+                }
+            })
+            .collect();
+        for v in 0..g.len() {
+            if g.inside[v] && keep[v] {
+                field[v] = 1.0;
+            }
+        }
+        return field;
+    }
     let blur = |x: &[f64]| -> Vec<f64> {
         let mut out = vec![0.0; g.len()];
         let mut nb = Vec::new();
@@ -1264,7 +1311,7 @@ fn smooth(g: &Grid, x: &[f64], keep: &[bool]) -> Vec<f64> {
                 0.0
             } else if keep[v] {
                 1.0
-            } else if x[v] > 0.5 {
+            } else if solid(v) {
                 b[v].max(0.56)
             } else {
                 b[v].min(0.44)
@@ -1324,14 +1371,14 @@ fn face_connected(set: u8) -> bool {
     seen == set
 }
 
-fn result(p: &Problem, s: &Settings, mask: &[bool], chk: &Check, iterations: usize, note: Vec<String>) -> Outcome {
+fn result(p: &Problem, s: &Settings, mask: &[bool], rho: Option<&[f64]>, chk: &Check, iterations: usize, note: Vec<String>) -> Outcome {
     let g = &p.grid;
     let mut mask = mask.to_vec();
     fix_diagonals(g, &mut mask);
     let mask = &mask[..];
     let x: Vec<f64> = mask.iter().map(|m| if *m { 1.0 } else { 0.0 }).collect();
     Outcome {
-        field: smooth(g, &x, &p.keep),
+        field: smooth(g, &x, rho, &p.keep),
         solid_voxels: mask.iter().filter(|m| **m).count(),
         design_voxels: g.inside.iter().filter(|m| **m).count(),
         stress: chk.stress,
@@ -1368,9 +1415,12 @@ fn organic(p: &Problem, s: &Settings, brick: &Brick, time_left: &mut dyn FnMut()
     let emin = e0 * 1e-4;
     let pen = 3.0;
     let keep: Vec<bool> = elems.iter().map(|&v| p.keep[v]).collect();
-    // Filter neighbourhood: a cone as wide as the thinnest member wanted, at least 1.5 voxels.
-    // It is what keeps the members from getting thinner than that.
-    let radius = (s.min_wall / g.h).clamp(1.5, 6.0);
+    // The design is three fields. The variables `x`, one per voxel, are what the optimiser
+    // changes. Their average over a cone as wide as the thinnest member wanted is the soft
+    // design: it cannot hold a member thinner than the cone, and its 0.5 level is a smooth
+    // surface that does not follow the voxels' steps. Pushed towards 0 and 1 around 0.5, it is
+    // the hard design, whose stiffness the structure is computed with.
+    let radius = (s.min_wall / g.h).clamp(1.8, 6.0);
     let mut local = vec![u32::MAX; g.len()];
     for (e, &v) in elems.iter().enumerate() {
         local[v] = e as u32;
@@ -1389,28 +1439,25 @@ fn organic(p: &Problem, s: &Settings, brick: &Brick, time_left: &mut dyn FnMut()
     }
     let cells: Vec<[i64; 3]> = elems.iter().map(|&v| g.ijk(v).map(|c| c as i64)).collect();
     let n = g.n.map(|c| c as i64);
-    // The filtered sensitivities, piece by piece on all cores.
-    let filter = |x: &[f64], dc: &[f64]| -> Vec<f64> {
-        let piece = |range: std::ops::Range<usize>| -> Vec<f64> {
-            range
-                .map(|e| {
-                    let c = cells[e];
-                    let (mut num, mut den) = (0.0, 0.0);
-                    for &(o, w) in &stencil {
-                        let q = [c[0] + o[0], c[1] + o[1], c[2] + o[2]];
-                        if q[0] < 0 || q[1] < 0 || q[2] < 0 || q[0] >= n[0] || q[1] >= n[1] || q[2] >= n[2] {
-                            continue;
-                        }
-                        let f = local[g.id(q[0] as usize, q[1] as usize, q[2] as usize)];
-                        if f != u32::MAX {
-                            num += w * x[f as usize] * dc[f as usize];
-                            den += w;
-                        }
-                    }
-                    num / (x[e].max(1e-3) * den)
-                })
-                .collect()
-        };
+    // The cone-weighted sum of `of` around element `e`.
+    let around = |e: usize, of: &[f64]| -> f64 {
+        let c = cells[e];
+        let mut sum = 0.0;
+        for &(o, w) in &stencil {
+            let q = [c[0] + o[0], c[1] + o[1], c[2] + o[2]];
+            if q[0] < 0 || q[1] < 0 || q[2] < 0 || q[0] >= n[0] || q[1] >= n[1] || q[2] >= n[2] {
+                continue;
+            }
+            let f = local[g.id(q[0] as usize, q[1] as usize, q[2] as usize)];
+            if f != u32::MAX {
+                sum += w * of[f as usize];
+            }
+        }
+        sum
+    };
+    // One value per element, piece by piece on all cores.
+    let each = |value: &(dyn Fn(usize) -> f64 + Sync)| -> Vec<f64> {
+        let piece = |range: std::ops::Range<usize>| -> Vec<f64> { range.map(value).collect() };
         let ranges: Vec<std::ops::Range<usize>> = (0..ne).step_by(PIECE).map(|a| a..(a + PIECE).min(ne)).collect();
         let workers = threads().min(ranges.len());
         if workers <= 1 {
@@ -1437,24 +1484,96 @@ fn organic(p: &Problem, s: &Settings, brick: &Brick, time_left: &mut dyn FnMut()
         }
         done.into_iter().flatten().collect()
     };
+    let ones = vec![1.0; ne];
+    let weight = each(&|e| around(e, &ones).max(1e-300));
+    let soften = |x: &[f64]| -> Vec<f64> { each(&|e| if keep[e] { 1.0 } else { around(e, x) / weight[e] }) };
+    // The hard design from the soft one, and its slope: a smooth step at 0.5, steeper with `beta`.
+    let harden = |beta: f64, soft: f64| ((0.5 * beta).tanh() + (beta * (soft - 0.5)).tanh()) / (2.0 * (0.5 * beta).tanh());
+    let slope = |beta: f64, soft: f64| beta * (1.0 - (beta * (soft - 0.5)).tanh().powi(2)) / (2.0 * (0.5 * beta).tanh());
 
     let schedule: Vec<f64> = match s.volume {
         Some(v) => vec![v.clamp(0.05, 1.0)],
         None => vec![0.5, 0.4, 0.32, 0.26, 0.21, 0.17, 0.14, 0.11, 0.09, 0.075, 0.062, 0.051, 0.042, 0.035, 0.029, 0.024, 0.02],
     };
+    let mut u = Vec::new();
+    let mut ub = Vec::new();
+    let mut iterations = 0;
+    // One step of the optimiser towards the stiffest design of `vf` of the design space.
+    let mut advance = |x: &mut Vec<f64>, vf: f64, beta: f64, mv: f64| {
+        iterations += 1;
+        let soft = soften(x);
+        let hard: Vec<f64> = soft.iter().map(|&r| harden(beta, r)).collect();
+        let stiff: Vec<f64> = hard.iter().map(|r| (emin + r.powf(pen) * (e0 - emin)) * g.h).collect();
+        fem.solve(&stiff, &mut u, 5e-3, 40);
+        let en = fem.energies(&u);
+        // What the compliance gains from each voxel of the soft design, shared out over the
+        // variables that make that voxel.
+        let gain: Vec<f64> = (0..ne).map(|e| -pen * hard[e].powf(pen - 1.0) * (e0 - emin) * g.h * en[e] * slope(beta, soft[e]) / weight[e]).collect();
+        let dc = each(&|e| around(e, &gain));
+        // Optimality criteria update.
+        let target = vf * ne as f64;
+        let (mut l1, mut l2) = (0.0f64, 1e12f64);
+        let mut xn = x.clone();
+        for _ in 0..80 {
+            let lm = 0.5 * (l1 + l2);
+            for e in 0..ne {
+                xn[e] = if keep[e] {
+                    1.0
+                } else {
+                    let be = (-dc[e] / lm).max(0.0).sqrt();
+                    (x[e] * be).clamp((x[e] - mv).max(1e-3), (x[e] + mv).min(1.0))
+                };
+            }
+            if xn.iter().sum::<f64>() > target {
+                l1 = lm;
+            } else {
+                l2 = lm;
+            }
+            if (l2 - l1) / (l1 + l2).max(1e-300) < 1e-4 {
+                break;
+            }
+        }
+        *x = xn;
+    };
+    // The 0/1 design `x` stands for, checked for stress and deflection. It is cut from the soft
+    // design at the level that leaves as much material as the variables hold, which is 0.5 once
+    // the design has a clear edge; the soft design is returned moved by that, with the cut at 0.5.
+    let allowed = allowed_stress(s);
+    let mut check = |x: &[f64]| -> (Vec<bool>, Vec<f64>, Check, bool) {
+        let soft = soften(x);
+        let amount = x.iter().sum::<f64>();
+        let (mut lo, mut hi) = (0.05f64, 0.95f64);
+        for _ in 0..30 {
+            let level = 0.5 * (lo + hi);
+            if soft.iter().filter(|r| **r > level).count() as f64 > amount {
+                lo = level;
+            } else {
+                hi = level;
+            }
+        }
+        let level = 0.5 * (lo + hi);
+        let mut mask = vec![false; g.len()];
+        let mut rho = vec![0.0; g.len()];
+        for (e, &v) in elems.iter().enumerate() {
+            mask[v] = soft[e] > level || keep[e];
+            rho[v] = (soft[e] - level + 0.5).clamp(0.0, 1.0);
+        }
+        let mask = thick(g, &mask, &rho, &p.keep);
+        let chk = check_binary(p, brick, &mask, s, &mut ub);
+        let ok = chk.connected && chk.stress <= allowed && (!(s.max_deflection > 0.0) || chk.deflection <= s.max_deflection);
+        (connected_part(g, &mask, &p.fixed), rho, chk, ok)
+    };
+
     let mut x = vec![schedule[0]; ne];
     for e in 0..ne {
         if keep[e] {
             x[e] = 1.0;
         }
     }
-    let mut u = Vec::new();
-    let mut ub = Vec::new();
-    let mut best: Option<(Vec<bool>, Check, f64)> = None;
-    let mut iterations = 0;
+    let mut best: Option<(Vec<bool>, Vec<f64>, Check, f64, Vec<f64>)> = None;
     let mut notes = Vec::new();
-    let allowed = allowed_stress(s);
     let mut out_of_time = false;
+    // Less and less material, until the design no longer carries the force.
     for (step, &vf) in schedule.iter().enumerate() {
         if out_of_time {
             break;
@@ -1466,48 +1585,11 @@ fn organic(p: &Problem, s: &Settings, brick: &Brick, time_left: &mut dyn FnMut()
                 out_of_time = true;
                 break;
             }
-            iterations += 1;
-            let stiff: Vec<f64> = x.iter().map(|xe| (emin + xe.powf(pen) * (e0 - emin)) * g.h).collect();
-            fem.solve(&stiff, &mut u, 5e-3, 40);
-            let en = fem.energies(&u);
-            let dc: Vec<f64> = (0..ne).map(|e| -pen * x[e].powf(pen - 1.0) * (e0 - emin) * g.h * en[e]).collect();
-            // Sensitivity filter.
-            let dcf = filter(&x, &dc);
-            // Optimality criteria update.
-            let target = vf * ne as f64;
-            let (mut l1, mut l2) = (0.0f64, 1e12f64);
-            let mv = 0.2;
-            let mut xn = x.clone();
-            for _ in 0..80 {
-                let lm = 0.5 * (l1 + l2);
-                for e in 0..ne {
-                    xn[e] = if keep[e] {
-                        1.0
-                    } else {
-                        let be = (-dcf[e] / lm).max(0.0).sqrt();
-                        (x[e] * be).clamp((x[e] - mv).max(1e-3), (x[e] + mv).min(1.0))
-                    };
-                }
-                if xn.iter().sum::<f64>() > target {
-                    l1 = lm;
-                } else {
-                    l2 = lm;
-                }
-                if (l2 - l1) / (l1 + l2).max(1e-300) < 1e-4 {
-                    break;
-                }
-            }
-            x = xn;
+            advance(&mut x, vf, 2.0, 0.2);
         }
-        // Stress check of the 0/1 design this step reached.
-        let mut mask = vec![false; g.len()];
-        for (e, &v) in elems.iter().enumerate() {
-            mask[v] = x[e] > 0.5 || keep[e];
-        }
-        let chk = check_binary(p, brick, &mask, s, &mut ub);
-        let ok = chk.connected && chk.stress <= allowed && (!(s.max_deflection > 0.0) || chk.deflection <= s.max_deflection);
+        let (mask, rho, chk, ok) = check(&x);
         if ok || best.is_none() || s.volume.is_some() {
-            best = Some((connected_part(g, &mask, &p.fixed), chk, vf));
+            best = Some((mask, rho, chk, vf, x.clone()));
         }
         if !ok && s.volume.is_none() {
             if step == 0 {
@@ -1516,9 +1598,29 @@ fn organic(p: &Problem, s: &Settings, brick: &Brick, time_left: &mut dyn FnMut()
             break;
         }
     }
-    let (mask, chk, vf) = best.ok_or_else(|| "no shape carries the load".to_string())?;
+    // With the amount of material found, the design is worked out: the step at 0.5 gets steeper,
+    // so members get a clear edge and what carries nothing goes away.
+    if !out_of_time && let Some((.., vf, start)) = &best {
+        let (vf, mut x) = (*vf, start.clone());
+        'finish: for beta in [4.0, 8.0, 12.0] {
+            for _ in 0..10 {
+                if !time_left() {
+                    out_of_time = true;
+                    break 'finish;
+                }
+                advance(&mut x, vf, beta, 0.1);
+            }
+        }
+        if !out_of_time {
+            let (mask, rho, chk, ok) = check(&x);
+            if ok {
+                best = Some((mask, rho, chk, vf, x));
+            }
+        }
+    }
+    let (mask, rho, chk, vf, _) = best.ok_or_else(|| "no shape carries the load".to_string())?;
     notes.push(format!("Material left: {:.0} % of the design space.", vf * 100.0));
-    Ok(result(p, s, &mask, &chk, iterations, notes))
+    Ok(result(p, s, &mask, Some(&rho), &chk, iterations, notes))
 }
 
 /// Distance of every inside voxel to the outside, in voxels (city-block BFS).
@@ -1647,7 +1749,7 @@ fn tree(p: &Problem, s: &Settings, brick: &Brick, time_left: &mut dyn FnMut() ->
     iterations += 1;
     if !(chk.connected && chk.stress <= allowed) {
         let notes = vec!["The stress is too high even with the thickest branches: more space, a stronger material or less force.".to_owned()];
-        return Ok(result(p, s, &hi_mask, &chk, iterations, notes));
+        return Ok(result(p, s, &hi_mask, None, &chk, iterations, notes));
     }
     best = best.or(Some((hi_mask, chk)));
     for _ in 0..7 {
@@ -1670,7 +1772,7 @@ fn tree(p: &Problem, s: &Settings, brick: &Brick, time_left: &mut dyn FnMut() ->
     }
     let (mask, chk) = best.ok_or("no shape carries the load")?;
     let notes = vec![format!("{} branches from the load to {} held faces.", path.len().min(1) * reached, reached)];
-    Ok(result(p, s, &mask, &chk, iterations, notes))
+    Ok(result(p, s, &mask, None, &chk, iterations, notes))
 }
 
 fn lattice(p: &Problem, s: &Settings, brick: &Brick, time_left: &mut dyn FnMut() -> bool) -> Result<Outcome, String> {
@@ -1702,13 +1804,13 @@ fn lattice(p: &Problem, s: &Settings, brick: &Brick, time_left: &mut dyn FnMut()
         let ok = chk.connected && chk.stress <= allowed;
         let note = vec![format!("Shell {:.1} mm, lattice cell {:.1} mm.", skin * g.h, cell as f64 * g.h)];
         if ok {
-            return Ok(result(p, s, &mask, &chk, iterations, note));
+            return Ok(result(p, s, &mask, None, &chk, iterations, note));
         }
         last = Some((mask, chk, note));
     }
     let (mask, chk, mut note) = last.ok_or("no shape carries the load")?;
     note.push("Auch das dichteste Gitter erreicht die Sicherheit nicht.".into());
-    Ok(result(p, s, &mask, &chk, iterations, note))
+    Ok(result(p, s, &mask, None, &chk, iterations, note))
 }
 
 // ---------------------------------------------------------------- surface
@@ -1803,19 +1905,20 @@ pub fn surface(g: &Grid, field: &[f64], up: usize, smooth_iters: usize, cuts: &[
             for i in 0..pn[0] {
                 // Position in voxel-centre units, padded by one.
                 let f = [i, j, k].map(|c| (c as f64 + 0.5) / up as f64 - 1.0);
-                let b = f.map(|c| c.floor());
-                let t = [f[0] - b[0], f[1] - b[1], f[2] - b[2]];
-                let (x0, y0, z0) = (b[0] as i64, b[1] as i64, b[2] as i64);
+                // A quadratic B-spline through the 27 voxels around: unlike a linear blend it
+                // has no kinks where the voxels meet, which would show as ripples on a member
+                // that runs across the grid.
+                let near = f.map(|c| c.round());
+                let weights: [[f64; 3]; 3] = std::array::from_fn(|a| {
+                    let d = f[a] - near[a];
+                    [0.5 * (0.5 - d) * (0.5 - d), 0.75 - d * d, 0.5 * (0.5 + d) * (0.5 + d)]
+                });
+                let (x0, y0, z0) = (near[0] as i64 - 1, near[1] as i64 - 1, near[2] as i64 - 1);
                 let mut acc = 0.0;
-                for dz in 0..2 {
-                    for dy in 0..2 {
-                        for dx in 0..2 {
-                            let w = (if dx == 1 { t[0] } else { 1.0 - t[0] })
-                                * (if dy == 1 { t[1] } else { 1.0 - t[1] })
-                                * (if dz == 1 { t[2] } else { 1.0 - t[2] });
-                            if w > 0.0 {
-                                acc += w * val(x0 + dx, y0 + dy, z0 + dz);
-                            }
+                for (dz, wz) in weights[2].iter().enumerate() {
+                    for (dy, wy) in weights[1].iter().enumerate() {
+                        for (dx, wx) in weights[0].iter().enumerate() {
+                            acc += wx * wy * wz * val(x0 + dx as i64, y0 + dy as i64, z0 + dz as i64);
                         }
                     }
                 }
