@@ -45,6 +45,7 @@ pub(super) fn command(kind: &Kind) -> Option<&'static str> {
         Kind::Sweep { .. } => Some("solid.sweep"),
         Kind::Midplane => Some("construct.plane.midplane"),
         Kind::MeshConvert { .. } => Some("mesh.convert"),
+        Kind::Generative { .. } => Some("generative.design"),
         Kind::Construct { command, .. } => Some(command),
         Kind::ConstructAuto { command, .. } => Some(command),
         Kind::PathPlane { .. } => Some("construct.plane.along_path"),
@@ -975,6 +976,18 @@ fn additional_rows(app: &mut SolveApp, d: &mut Dialog, ui: &mut egui::Ui) -> boo
         }
         Kind::MeshConvert { tolerance } => {
             form_row(ui, "Tolerance", |ui| enter |= field(ui, tolerance));
+        }
+        Kind::Generative { force, direction, style, detail } => {
+            form_row(ui, "Force (N)", |ui| enter |= field(ui, force));
+            form_row(ui, "Direction", |ui| {
+                ui_kit::segmented(ui, direction, &GENERATIVE_DIRECTIONS.map(|(label, _)| label), Default::default());
+            });
+            form_row(ui, "Style", |ui| {
+                ui_kit::segmented(ui, style, &GENERATIVE_STYLES.map(|(label, _)| label), Default::default());
+            });
+            form_row(ui, "Detail", |ui| {
+                ui_kit::segmented(ui, detail, &GENERATIVE_DETAIL.map(|(label, _)| label), Default::default());
+            });
         }
         Kind::Construct { t: Some(t), .. } => {
             form_row(ui, "Position (0 to 1)", |ui| enter |= field(ui, t));

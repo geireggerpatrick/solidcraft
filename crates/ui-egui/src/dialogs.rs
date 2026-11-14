@@ -260,6 +260,15 @@ crate::dialog_descriptor::dialog_descriptors! {
             MeshConvert {
                 tolerance: String,
             },
+            /// A light structure grown between held and loaded faces. `direction` indexes
+            /// [`super::GENERATIVE_DIRECTIONS`], `style` the engine's styles and `detail` the cell
+            /// counts of [`super::GENERATIVE_DETAIL`].
+            Generative {
+                force: String,
+                direction: usize,
+                style: usize,
+                detail: usize,
+            },
             /// A construction axis, point or plane made from picks alone (#2474): input `i` is the
             /// command's parameter `keys[i]`, and `t` (along a path) when it takes one.
             Construct {
@@ -730,7 +739,8 @@ fn display_quality(app: &SolveApp) -> solidcraft_engine::doc::display_quality::D
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn begin_applying(app: &SolveApp, d: &Dialog) -> Option<Applying> {
     let wait = app.apply_off_thread?;
-    if !d.previews() && d.editing.is_none() {
+    // A generative design computes for minutes: never on the window's thread.
+    if !d.previews() && d.editing.is_none() && !matches!(d.kind, Kind::Generative { .. }) {
         return None;
     }
     let computation = DialogComputation::new(app, d).ok()?;
@@ -1020,6 +1030,10 @@ impl Dialog {
             "mesh.convert" => Dialog::new(
                 Kind::MeshConvert { tolerance: crate::length_input::model(&s.doc, 0.05) },
                 vec![SelInput::new("Mesh body", BODIES, false)],
+            ),
+            "generative.design" => Dialog::new(
+                Kind::Generative { force: "100".into(), direction: 5, style: 0, detail: 1 },
+                vec![SelInput::new("Held faces", FACES, true), SelInput::new("Loaded faces", FACES, true)],
             ),
             // Plane, Axis and Point open as the method their picks call for (`dialogs_auto`).
             _ if solidcraft_engine::cmd::is_construct_tool(id) => return auto::start(app, id),
@@ -2834,6 +2848,7 @@ fn title(k: &Kind) -> &'static str {
         Kind::Material { .. } => "PHYSICAL MATERIAL",
         Kind::Midplane => "MIDPLANE",
         Kind::MeshConvert { .. } => "CONVERT MESH",
+        Kind::Generative { .. } => "GENERATIVE DESIGN",
         Kind::Construct { title, .. } => title,
         Kind::ConstructAuto { command: "construct.plane", .. } => "cmd.construct.plane",
         Kind::ConstructAuto { command: "construct.axis", .. } => "cmd.construct.axis",
@@ -4536,6 +4551,20 @@ pub(crate) struct RememberedCommand {
     extra: serde_json::Map<String, Value>,
 }
 
+/// The directions a generative design's force can point in: the label and the unit vector.
+pub(crate) const GENERATIVE_DIRECTIONS: [(&str, [f64; 3]); 6] = [
+    ("+X", [1.0, 0.0, 0.0]),
+    ("-X", [-1.0, 0.0, 0.0]),
+    ("+Y", [0.0, 1.0, 0.0]),
+    ("-Y", [0.0, -1.0, 0.0]),
+    ("+Z", [0.0, 0.0, 1.0]),
+    ("-Z", [0.0, 0.0, -1.0]),
+];
+/// A generative design's styles: the label and the engine's name.
+pub(crate) const GENERATIVE_STYLES: [(&str, &str); 3] = [("Organic", "organic"), ("Tree", "tree"), ("Lattice", "lattice")];
+/// A generative design's levels of detail: the label and the cells to compute with.
+pub(crate) const GENERATIVE_DETAIL: [(&str, f64); 3] = [("Coarse", 40_000.0), ("Medium", 120_000.0), ("Fine", 400_000.0)];
+
 /// Whether two dialog kinds are the same command (a chamfer is not a fillet).
 fn same_command(a: &Kind, b: &Kind) -> bool {
     let Some(command) = dense::command(a) else { return false };
@@ -6004,6 +6033,29 @@ fn dialog_commands(app: &SolveApp, d: &Dialog) -> Result<Vec<(String, Value)>, S
                 // A null `through` keeps a saved snap point (`extra`) out: the plane is at the distance.
                 None => ("construct.plane.offset", json!({"base": base, "through": null})),
             }
+        }
+        Kind::Generative { force, direction, style, detail } => {
+            need(0, "the held faces")?;
+            need(1, "the loaded faces")?;
+            let newtons: f64 =
+                force.trim().replace(',', ".").parse().ok().filter(|n: &f64| n.is_finite() && *n > 0.0).ok_or("give the force in newtons")?;
+            let faces = |i: usize| -> Vec<Value> {
+                sels(d, i)
+                    .iter()
+                    .filter_map(|x| if let Sel::Face { body, point, .. } = x { Some(json!({"body": body, "point": pt(*point)})) } else { None })
+                    .collect()
+            };
+            let axis = GENERATIVE_DIRECTIONS.get(*direction).map_or([0.0, 0.0, -1.0], |(_, v)| *v);
+            (
+                "generative.design",
+                json!({
+                    "held": faces(0),
+                    "load": faces(1),
+                    "force": axis.map(|c| c * newtons),
+                    "style": GENERATIVE_STYLES.get(*style).map_or("organic", |(_, id)| *id),
+                    "voxels": GENERATIVE_DETAIL.get(*detail).map_or(120_000.0, |(_, n)| *n),
+                }),
+            )
         }
         Kind::MeshConvert { tolerance } => {
             need(0, "the mesh body")?;

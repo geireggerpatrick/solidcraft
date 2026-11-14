@@ -641,6 +641,7 @@ form_case!(sweep, "solid.sweep", ["Orientation"]);
 form_case!(offset_plane, "construct.plane.offset", ["Distance"]);
 form_case!(midplane, "construct.plane.midplane", []);
 form_case!(mesh_convert, "mesh.convert", ["Tolerance"]);
+form_case!(generative_design, "generative.design", ["Force (N)", "Direction", "Style", "Detail"]);
 form_case!(axis_two_planes, "construct.axis.two_planes", []);
 form_case!(point_along_path, "construct.point.along_path", ["Position (0 to 1)"]);
 form_case!(angle_plane, "construct.plane.at_angle", ["Angle"]);

@@ -5774,6 +5774,7 @@ dependencies = [
  "solidcraft-3dx-client",
  "solidcraft-control",
  "solidcraft-engine",
+ "solidcraft-generative-gpu",
  "solidcraft-gpu",
  "solidcraft-look",
  "solidcraft-space-mouse",
@@ -5803,6 +5804,7 @@ dependencies = [
  "serde_json",
  "solidcore-record",
  "solidcraft-engine",
+ "solidcraft-generative-gpu",
  "solidcraft-gpu",
  "solidcraft-kernel",
  "solidcraft-mcp",
@@ -5927,6 +5929,16 @@ dependencies = [
 [[package]]
 name = "solidcraft-generative"
 version = "0.42.0"
+
+[[package]]
+name = "solidcraft-generative-gpu"
+version = "0.42.0"
+dependencies = [
+ "pollster 0.4.0",
+ "solidcraft-generative",
+ "solidcraft-viewport-gpu",
+ "wgpu",
+]
 
 [[package]]
 name = "solidcraft-geom"

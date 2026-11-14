@@ -52,6 +52,8 @@ pub const TABLE: &[(&str, Class)] = &[
     ("profile", Class::Standalone),
     // generative design: voxel finite elements, topology optimisation, truss layout (no workspace dependencies)
     ("generative", Class::Standalone),
+    // its linear problems solved on the GPU: multigrid conjugate gradients in wgpu compute shaders
+    ("generative-gpu", Class::Layer(5)),
     ("sketch", Class::Layer(1)),
     // the B-rep kernel, solidcore (the Rust port of NVIDIA's SMLib, ADR 0002); only the kernel uses it
     ("smlib", Class::Layer(1)),

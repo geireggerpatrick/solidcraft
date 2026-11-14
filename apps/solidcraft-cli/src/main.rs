@@ -143,6 +143,7 @@ const COMMANDS: &[Command] = &[
 fn main() -> ExitCode {
     let mut args: Vec<String> = std::env::args().skip(1).collect();
     logger::init(&mut args);
+    solidcraft_generative_gpu::install();
     // `--profile` / `--profile-out` (run, eval, bench-open) or SOLIDCRAFT_PROFILE (any command):
     // record from here, and print the table when the command ends.
     let profiling = match args.first().map(String::as_str) {

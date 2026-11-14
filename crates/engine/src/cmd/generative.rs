@@ -21,7 +21,7 @@ pub static COMMANDS: &[CommandSpec] = &[
         .icon("import")
         .contract(&DESIGN_CONTRACT)
         .output(output_schema_for::<FeatureResult>)
-        .params("held: [{body, point: [x,y,z]}] (faces that are held); load: [{body, point: [x,y,z]}] (faces the force acts on); force: [x,y,z] in newtons; style?: organic|tree|lattice (default organic); space?: body to carve the structure out of (default: the box around the picked faces, around the bodies they belong to, which stay as they are); avoid?: [body] (further bodies to stay clear of); margin?: mm the design box reaches beyond the faces; strength?: MPa (default 35); modulus?: MPa (default 1900); safety?: 1…20 (default 2); voxels?: 500…2000000 cells (default 40000); wall?: thinnest strut in mm (default: 4 % of the design space's longest side); name?; body_name? (default Generative): a new mesh body that carries the force from the loaded to the held faces with as little material as the strength allows"),
+        .params("held: [{body, point: [x,y,z]}] (faces that are held); load: [{body, point: [x,y,z]}] (faces the force acts on); force: [x,y,z] in newtons; style?: organic|tree|lattice (default organic); space?: body to carve the structure out of (default: the box around the picked faces, around the bodies they belong to, which stay as they are); avoid?: [body] (further bodies to stay clear of); margin?: mm the design box reaches beyond the faces; strength?: MPa (default 35); modulus?: MPa (default 1900); safety?: 1…20 (default 2); voxels?: 500…2000000 cells (default 40000); wall?: thinnest strut in mm (default: 4 % of the design space's longest side); deflection?: the most the loaded faces may move, in mm (default: 1/400 of the design space's longest side); name?; body_name? (default Generative): a new mesh body that carries the force from the loaded to the held faces with as little material as the strength allows"),
 ];
 
 fn v3(p: Vec3) -> V3 {
@@ -94,6 +94,10 @@ fn design(s: &mut Session, p: &Value) -> Result<Value> {
         None => 0.0,
         Some(_) => in_range(q.wall, 1.0, 0.2, 100.0, "wall")?,
     };
+    let deflection = match q.deflection {
+        None => 0.0,
+        Some(_) => in_range(q.deflection, 1.0, 0.001, 1000.0, "deflection")?,
+    };
     let margin = in_range(q.margin, 0.0, 0.0, 1000.0, "margin")?;
 
     let st = s.model.state();
@@ -128,7 +132,15 @@ fn design(s: &mut Session, p: &Value) -> Result<Value> {
         obstacles: obstacles.iter().filter_map(|n| body_mesh(&st, n)).collect(),
         margin,
         voxels,
-        settings: Settings { style, material: Material { strength, modulus, density: 1.27 }, safety, volume: None, min_wall: wall },
+        settings: Settings {
+            style,
+            material: Material { strength, modulus, density: 1.27 },
+            safety,
+            volume: None,
+            min_wall: wall,
+            max_deflection: deflection,
+            accelerate: true,
+        },
     };
     let Report { mesh, outcome, .. } = study::run(&study, &mut || true).map_err(|e| bad(CMD, e))?;
     if mesh.pos.len() > u32::MAX as usize {

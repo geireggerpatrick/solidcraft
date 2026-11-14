@@ -1,5 +1,7 @@
 //! Runs a small study and writes the structure as an STL file, to look at a change quickly:
-//! `cargo run --release -p solidcraft-generative --example study -- shelf out.stl [voxels] [style] [newtons] [wall]`.
+//! `cargo run --release -p solidcraft-generative-gpu --example study -- shelf out.stl [voxels] [style] [newtons] [wall] [cpu|gpu|any]`.
+//! `gpu` (the default) computes on a hardware adapter when there is one, `any` also on a software
+//! adapter, `cpu` never on an adapter.
 
 use std::io::Write;
 
@@ -23,6 +25,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     let newtons: f64 = args.get(5).and_then(|v| v.parse().ok()).unwrap_or(300.0);
     let wall: f64 = args.get(6).and_then(|v| v.parse().ok()).unwrap_or(4.0);
+    match args.get(7).map(String::as_str) {
+        Some("cpu") => println!("computing on the CPU"),
+        mode => {
+            let policy =
+                if mode == Some("any") { solidcraft_viewport_gpu::select::Policy::Auto } else { solidcraft_viewport_gpu::select::Policy::Hardware };
+            match solidcraft_generative_gpu::GpuSolver::open(policy) {
+                Ok(solver) => {
+                    println!("computing on {}", solidcraft_generative::voxel::GridSolver::name(&solver));
+                    solidcraft_generative::voxel::set_grid_solver(Some(Box::new(solver)));
+                }
+                Err(e) => println!("computing on the CPU: {e}"),
+            }
+        }
+    }
     let (held, load, obstacles): (Vec<[V3; 3]>, Vec<[V3; 3]>, Vec<Mesh>) = match case {
         // Two plates facing each other, 115 mm apart.
         "plates" => (
@@ -51,6 +67,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             safety: 2.0,
             volume: None,
             min_wall: wall,
+            max_deflection: 0.0,
+            accelerate: true,
         },
     };
     let t = std::time::Instant::now();

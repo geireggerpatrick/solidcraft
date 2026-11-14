@@ -427,7 +427,78 @@ impl Brick {
 }
 
 /// A linear elastic model over some voxels of the grid.
+/// The stiffness of a unit voxel of unit modulus, as a [`GridJob`] carries it.
+pub fn unit_stiffness() -> [[f64; 24]; 24] {
+    Brick::new().ke
+}
+
+/// One linear problem on the whole voxel grid, for a solver outside this crate (a GPU): find the
+/// displacements `d` with `K d = rhs`, where `K` is the grid's stiffness with the held nodes
+/// taken out. Nodes are numbered `i + (n[0] + 1) * (j + (n[1] + 1) * k)`, voxels as in [`Grid`].
+pub struct GridJob<'a> {
+    /// Voxels along x, y and z.
+    pub n: [usize; 3],
+    /// The stiffness of a unit voxel of unit modulus: 8 corners with 3 directions each, the
+    /// corners in the order (0,0,0) (1,0,0) (1,1,0) (0,1,0) (0,0,1) (1,0,1) (1,1,1) (0,1,1).
+    pub ke: &'a [[f64; 24]; 24],
+    /// What each voxel's stiffness is multiplied with; 0 for a voxel that is not there.
+    pub stiff: &'a [f32],
+    /// Per node: held in all three directions.
+    pub fixed: &'a [bool],
+    /// Three values per node; 0 at the held nodes.
+    pub rhs: &'a [f32],
+    /// Stop when the residual is this small against `rhs`.
+    pub tol: f64,
+    pub max_iter: usize,
+}
+
+/// A solver for [`GridJob`]s.
+pub trait GridSolver: Send {
+    /// The displacements, three per node, and the iterations it took.
+    fn solve(&mut self, job: &GridJob) -> Result<(Vec<f32>, usize), String>;
+    /// What computes, for the notes of a result.
+    fn name(&self) -> String;
+}
+
+static GRID_SOLVER: std::sync::Mutex<Option<Box<dyn GridSolver>>> = std::sync::Mutex::new(None);
+
+/// Installs (or with `None` removes) the solver that designs with [`Settings::accelerate`] set
+/// use for their linear problems. Without one, or when it fails, the built-in solver computes.
+pub fn set_grid_solver(solver: Option<Box<dyn GridSolver>>) {
+    if let Ok(mut slot) = GRID_SOLVER.lock() {
+        *slot = solver;
+    }
+}
+
+/// What opens the solver when a design first asks for one.
+type SolverSource = Box<dyn FnOnce() -> Option<Box<dyn GridSolver>> + Send>;
+
+static GRID_SOLVER_SOURCE: std::sync::Mutex<Option<SolverSource>> = std::sync::Mutex::new(None);
+
+/// Registers what opens the solver, to be called once, when a design with
+/// [`Settings::accelerate`] first needs it: a program that never computes a design opens none.
+pub fn set_grid_solver_source(source: impl FnOnce() -> Option<Box<dyn GridSolver>> + Send + 'static) {
+    if let Ok(mut slot) = GRID_SOLVER_SOURCE.lock() {
+        *slot = Some(Box::new(source));
+    }
+}
+
+/// The installed solver's name; opens the solver if a source for one is registered.
+pub fn grid_solver_name() -> Option<String> {
+    let source = GRID_SOLVER_SOURCE.lock().ok()?.take();
+    if let Some(open) = source
+        && let Some(solver) = open()
+    {
+        set_grid_solver(Some(solver));
+    }
+    GRID_SOLVER.lock().ok()?.as_ref().map(|s| s.name())
+}
+
 struct Fem<'a> {
+    /// For each node of the model, its node on the whole grid.
+    grid_node: Vec<u32>,
+    /// Whether to hand the linear problems to the installed [`GridSolver`].
+    accelerate: bool,
     g: &'a Grid,
     brick: &'a Brick,
     elems: Vec<usize>,
@@ -435,14 +506,16 @@ struct Fem<'a> {
     ndof: usize,
     fixed: Vec<bool>,
     force: Vec<f64>,
-    mg: Multigrid<'a>,
+    /// The built-in solver's levels, built when it first solves.
+    mg: std::sync::OnceLock<Multigrid<'a>>,
+    coords: Vec<[usize; 3]>,
 }
 
 const NONE: u32 = u32::MAX;
 
 impl<'a> Fem<'a> {
     /// `elems`: the voxels in the model; `fixed`/`load`: voxels whose nodes are held / loaded.
-    fn new(g: &'a Grid, brick: &'a Brick, elems: Vec<usize>, fixed: &[bool], load: &[bool], f: V3) -> Fem<'a> {
+    fn new(g: &'a Grid, brick: &'a Brick, elems: Vec<usize>, fixed: &[bool], load: &[bool], f: V3, accelerate: bool) -> Fem<'a> {
         let nn = (g.n[0] + 1) * (g.n[1] + 1) * (g.n[2] + 1);
         let node = |i: usize, j: usize, k: usize| i + (g.n[0] + 1) * (j + (g.n[1] + 1) * k);
         let corners = |v: usize| -> [usize; 8] {
@@ -507,8 +580,14 @@ impl<'a> Fem<'a> {
             }
         }
         let coords: Vec<[usize; 3]> = elems.iter().map(|&v| g.ijk(v)).collect();
-        let mg = Multigrid::new(brick, g.n, &coords, &dofs, ndof, &fixed_dof);
-        Fem { g, brick, elems, dofs, ndof, fixed: fixed_dof, force, mg }
+        let mut grid_node = vec![0u32; count as usize];
+        for (n, &m) in map.iter().enumerate() {
+            if m != NONE {
+                grid_node[m as usize] = n as u32;
+            }
+        }
+        let accelerate = accelerate && grid_solver_name().is_some();
+        Fem { grid_node, accelerate, g, brick, elems, dofs, ndof, fixed: fixed_dof, force, mg: std::sync::OnceLock::new(), coords }
     }
 
     fn matvec(&self, stiff: &[f64], x: &[f64], y: &mut [f64]) {
@@ -523,11 +602,89 @@ impl<'a> Fem<'a> {
     /// Solves K u = f by CG preconditioned with a geometric multigrid V-cycle, starting from `u`.
     /// Returns the iterations.
     fn solve(&self, stiff: &[f64], u: &mut Vec<f64>, tol: f64, max_iter: usize) -> usize {
+        if self.accelerate
+            && let Some(iterations) = self.solve_outside(stiff, u, tol, max_iter)
+        {
+            return iterations;
+        }
+        self.solve_here(stiff, u, tol, max_iter)
+    }
+
+    /// Solves with the installed [`GridSolver`], which computes in single precision: the
+    /// residual is taken here in double precision and the solver finds the correction to it,
+    /// until the residual is small enough. `None` when there is no solver or it failed.
+    fn solve_outside(&self, stiff: &[f64], u: &mut Vec<f64>, tol: f64, max_iter: usize) -> Option<usize> {
         let n = self.ndof;
         if u.len() != n {
             *u = vec![0.0; n];
         }
-        let mg = self.mg.prepare(stiff);
+        let g = self.g;
+        let nodes = (g.n[0] + 1) * (g.n[1] + 1) * (g.n[2] + 1);
+        let mut stiff_grid = vec![0.0f32; g.len()];
+        for (&v, &s) in self.elems.iter().zip(stiff) {
+            stiff_grid[v] = s as f32;
+        }
+        let mut fixed_grid = vec![false; nodes];
+        for (m, &node) in self.grid_node.iter().enumerate() {
+            fixed_grid[node as usize] = self.fixed[3 * m];
+        }
+        let bnorm = self.force.iter().map(|v| v * v).sum::<f64>().sqrt().max(1e-300);
+        let mut r = vec![0.0; n];
+        let mut total = 0;
+        for round in 0..6 {
+            self.matvec(stiff, u, &mut r);
+            for i in 0..n {
+                r[i] = if self.fixed[i] { 0.0 } else { self.force[i] - r[i] };
+            }
+            let rnorm = r.iter().map(|v| v * v).sum::<f64>().sqrt();
+            if rnorm / bnorm < tol || total >= max_iter {
+                return Some(total);
+            }
+            // Scaled to about one: single precision keeps its digits for the correction.
+            let scale = r.iter().fold(0.0f64, |a, v| a.max(v.abs())).max(1e-300);
+            let mut rhs = vec![0.0f32; 3 * nodes];
+            for (m, &node) in self.grid_node.iter().enumerate() {
+                for x in 0..3 {
+                    rhs[3 * node as usize + x] = (r[3 * m + x] / scale) as f32;
+                }
+            }
+            let inner = (0.5 * tol * bnorm / rnorm).clamp(1e-3, 0.5);
+            let job =
+                GridJob { n: g.n, ke: &self.brick.ke, stiff: &stiff_grid, fixed: &fixed_grid, rhs: &rhs, tol: inner, max_iter: max_iter - total };
+            let (d, iterations) = {
+                let mut slot = GRID_SOLVER.lock().ok()?;
+                let solved = slot.as_mut()?.solve(&job);
+                match solved {
+                    Ok(x) if x.0.len() == 3 * nodes && x.0.iter().all(|v| v.is_finite()) => x,
+                    // A solver that fails is not asked again: the built-in one takes over.
+                    _ => {
+                        *slot = None;
+                        return if round == 0 { None } else { Some(total) };
+                    }
+                }
+            };
+            total += iterations.max(1);
+            for (m, &node) in self.grid_node.iter().enumerate() {
+                for x in 0..3 {
+                    if !self.fixed[3 * m + x] {
+                        u[3 * m + x] += scale * d[3 * node as usize + x] as f64;
+                    }
+                }
+            }
+        }
+        Some(total)
+    }
+
+    fn levels(&self) -> &Multigrid<'a> {
+        self.mg.get_or_init(|| Multigrid::new(self.brick, self.g.n, &self.coords, &self.dofs, self.ndof, &self.fixed))
+    }
+
+    fn solve_here(&self, stiff: &[f64], u: &mut Vec<f64>, tol: f64, max_iter: usize) -> usize {
+        let n = self.ndof;
+        if u.len() != n {
+            *u = vec![0.0; n];
+        }
+        let mg = self.levels().prepare(stiff);
         let b: Vec<f64> = (0..n).map(|i| if self.fixed[i] { 0.0 } else { self.force[i] }).collect();
         for i in 0..n {
             if self.fixed[i] {
@@ -1003,6 +1160,10 @@ pub struct Settings {
     /// Fraction of the design space to keep; None = as little as the stress allows.
     pub volume: Option<f64>,
     pub min_wall: f64,
+    /// The most the loaded faces may move, in mm; 0 for no limit.
+    pub max_deflection: f64,
+    /// Compute with the installed [`GridSolver`] (a GPU) when there is one.
+    pub accelerate: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -1060,7 +1221,7 @@ fn check_binary(p: &Problem, brick: &Brick, mask: &[bool], s: &Settings, u: &mut
         return Check { stress: f64::INFINITY, deflection: f64::INFINITY, connected: false };
     }
     let elems: Vec<usize> = (0..g.len()).filter(|&v| part[v]).collect();
-    let fem = Fem::new(g, brick, elems, &p.fixed, &p.load, p.force);
+    let fem = Fem::new(g, brick, elems, &p.fixed, &p.load, p.force, s.accelerate);
     let e = s.material.modulus;
     let stiff = vec![e * g.h; fem.elems.len()];
     u.clear();
@@ -1193,7 +1354,7 @@ fn organic(p: &Problem, s: &Settings, brick: &Brick, time_left: &mut dyn FnMut()
     let g = &p.grid;
     let elems: Vec<usize> = (0..g.len()).filter(|&v| g.inside[v]).collect();
     let ne = elems.len();
-    let fem = Fem::new(g, brick, elems.clone(), &p.fixed, &p.load, p.force);
+    let fem = Fem::new(g, brick, elems.clone(), &p.fixed, &p.load, p.force, s.accelerate);
     let e0 = s.material.modulus;
     let emin = e0 * 1e-4;
     let pen = 3.0;
@@ -1335,7 +1496,7 @@ fn organic(p: &Problem, s: &Settings, brick: &Brick, time_left: &mut dyn FnMut()
             mask[v] = x[e] > 0.5 || keep[e];
         }
         let chk = check_binary(p, brick, &mask, s, &mut ub);
-        let ok = chk.connected && chk.stress <= allowed;
+        let ok = chk.connected && chk.stress <= allowed && (!(s.max_deflection > 0.0) || chk.deflection <= s.max_deflection);
         if ok || best.is_none() || s.volume.is_some() {
             best = Some((connected_part(g, &mask, &p.fixed), chk, vf));
         }
@@ -1832,7 +1993,15 @@ mod tests {
     }
 
     fn settings(style: Style) -> Settings {
-        Settings { style, material: Material { strength: 35.0, modulus: 1900.0, density: 1.27 }, safety: 2.5, volume: None, min_wall: 2.0 }
+        Settings {
+            style,
+            material: Material { strength: 35.0, modulus: 1900.0, density: 1.27 },
+            safety: 2.5,
+            volume: None,
+            min_wall: 2.0,
+            max_deflection: 0.0,
+            accelerate: false,
+        }
     }
 
     #[test]
@@ -1964,8 +2133,13 @@ mod bench {
         let mut load = none.clone();
         load[g.len() - 1] = true;
         let t = std::time::Instant::now();
-        let fem = Fem::new(&g, &brick, elems, &fixed, &load, [0.0, 0.0, -1.0]);
-        println!("build {:?} levels {} ndof {:?}", t.elapsed(), fem.mg.levels.len(), fem.mg.levels.iter().map(|l| l.ndof).collect::<Vec<_>>());
+        let fem = Fem::new(&g, &brick, elems, &fixed, &load, [0.0, 0.0, -1.0], false);
+        println!(
+            "build {:?} levels {} ndof {:?}",
+            t.elapsed(),
+            fem.levels().levels.len(),
+            fem.levels().levels.iter().map(|l| l.ndof).collect::<Vec<_>>()
+        );
         let stiff = vec![1.0; fem.elems.len()];
         let x = vec![1.0; fem.ndof];
         let mut y = vec![0.0; fem.ndof];
@@ -1975,7 +2149,7 @@ mod bench {
         }
         println!("matvec {:?}", t.elapsed() / 20);
         let t = std::time::Instant::now();
-        let p = fem.mg.prepare(&stiff);
+        let p = fem.levels().prepare(&stiff);
         println!("prepare {:?}", t.elapsed());
         let t = std::time::Instant::now();
         for _ in 0..5 {

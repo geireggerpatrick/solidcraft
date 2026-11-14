@@ -60,6 +60,10 @@ pub struct GenerativeDesignParams {
     /// space's longest side.
     #[serde(default)]
     pub wall: Option<f64>,
+    /// The most the loaded faces may move under the force, in mm, from 0.001 to 1000. Default:
+    /// 1/400 of the design space's longest side.
+    #[serde(default)]
+    pub deflection: Option<f64>,
     /// The feature's name in the timeline.
     #[serde(default)]
     pub name: Option<String>,

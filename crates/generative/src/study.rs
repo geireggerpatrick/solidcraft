@@ -29,7 +29,8 @@ pub struct Study {
     pub margin: f64,
     /// How many cells to divide the design space into.
     pub voxels: f64,
-    /// `min_wall` 0 means a thinnest member that suits the size of the design space.
+    /// `min_wall` 0 means a thinnest member that suits the size of the design space, and
+    /// `max_deflection` 0 a limit that does.
     pub settings: Settings,
 }
 
@@ -245,6 +246,12 @@ pub fn run(study: &Study, time_left: &mut dyn FnMut() -> bool) -> Result<Report,
     if !(settings.min_wall > 0.0) {
         let longest = (0..3).map(|a| problem.grid.n[a] as f64 * h).fold(0.0, f64::max);
         settings.min_wall = 0.04 * longest;
+    }
+    // With no limit given, the loaded faces may move by 1/400 of the longest side: a shape that
+    // only just does not break is too soft to be of use.
+    if !(settings.max_deflection > 0.0) {
+        let longest = (0..3).map(|a| problem.grid.n[a] as f64 * h).fold(0.0, f64::max);
+        settings.max_deflection = longest / 400.0;
     }
     let outcome = gv::generate(&problem, &settings, time_left)?;
     let g = &problem.grid;

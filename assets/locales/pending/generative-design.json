@@ -1,8 +1,36 @@
 {
   "de": {
-    "cmd.generative_design": "Generatives Design"
+    "cmd.generative_design": "Generatives Design",
+    "GENERATIVE DESIGN": "GENERATIVES DESIGN",
+    "Held faces": "Feste Flächen",
+    "Loaded faces": "Belastete Flächen",
+    "Force (N)": "Kraft (N)",
+    "Detail": "Detailgrad",
+    "Organic": "Organisch",
+    "Tree": "Baum",
+    "Lattice": "Gitter",
+    "Coarse": "Grob",
+    "Medium": "Mittel",
+    "Fine": "Fein"
   },
   "en": {
-    "cmd.generative_design": "Generative Design"
+    "cmd.generative_design": "Generative Design",
+    "GENERATIVE DESIGN": "GENERATIVE DESIGN",
+    "Held faces": "Held faces",
+    "Loaded faces": "Loaded faces",
+    "Force (N)": "Force (N)",
+    "Detail": "Detail",
+    "Organic": "Organic",
+    "Tree": "Tree",
+    "Lattice": "Lattice",
+    "Coarse": "Coarse",
+    "Medium": "Medium",
+    "Fine": "Fine",
+    "+X": "+X",
+    "-X": "-X",
+    "+Y": "+Y",
+    "-Y": "-Y",
+    "+Z": "+Z",
+    "-Z": "-Z"
   }
 }

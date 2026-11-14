@@ -26,6 +26,7 @@ solidcraft-smlib = { path = "crates/smlib" }
 solidcraft-render = { path = "crates/render" }
 solidcraft-dynamics = { path = "crates/dynamics" }
 solidcraft-generative = { path = "crates/generative" }
+solidcraft-generative-gpu = { path = "crates/generative-gpu" }
 solidcraft-gpu = { path = "crates/gpu" }
 solidcraft-doc = { path = "crates/doc" }
 # Versioned file formats: the format tag, the version registry and its upgrade, a newer file told
