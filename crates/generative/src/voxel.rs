@@ -189,6 +189,12 @@ impl Grid {
         }
         false
     }
+    /// The voxel a point lies in.
+    pub fn at(&self, p: V3) -> Option<usize> {
+        let c = [0, 1, 2].map(|a| ((p[a] - self.origin[a]) / self.h).floor());
+        (0..3).all(|a| c[a] >= 0.0 && c[a] < self.n[a] as f64).then(|| self.id(c[0] as usize, c[1] as usize, c[2] as usize))
+    }
+
     pub fn nearest(&self, p: V3, accept: impl Fn(usize) -> bool) -> Option<usize> {
         (0..self.len()).filter(|&v| accept(v)).min_by(|&a, &b| norm(sub(self.center(a), p)).total_cmp(&norm(sub(self.center(b), p))))
     }
@@ -200,7 +206,22 @@ pub fn voxelize(mesh: &Mesh, h: f64) -> Grid {
     let n = [0, 1, 2].map(|a| (((hi[a] - lo[a]) / h).ceil() as usize).max(1));
     // Centre the grid on the bounding box.
     let origin = [0, 1, 2].map(|a| (lo[a] + hi[a]) / 2.0 - n[a] as f64 * h / 2.0);
-    let mut grid = Grid { n, h, origin, inside: vec![false; n[0] * n[1] * n[2]] };
+    let mut grid = Grid { n, h, origin, inside: Vec::new() };
+    grid.inside = mesh_mask(&grid, mesh);
+    grid
+}
+
+/// A grid of cubes of edge `h` over the box `lo..hi`, every voxel in the design space.
+pub fn box_grid(lo: V3, hi: V3, h: f64) -> Grid {
+    let n = [0, 1, 2].map(|a| (((hi[a] - lo[a]) / h).ceil() as usize).max(1));
+    let origin = [0, 1, 2].map(|a| (lo[a] + hi[a]) / 2.0 - n[a] as f64 * h / 2.0);
+    Grid { n, h, origin, inside: vec![true; n[0] * n[1] * n[2]] }
+}
+
+/// For each voxel of the grid, whether its centre is inside the closed mesh.
+pub fn mesh_mask(g: &Grid, mesh: &Mesh) -> Vec<bool> {
+    let (n, h, origin) = (g.n, g.h, g.origin);
+    let mut inside = vec![false; n[0] * n[1] * n[2]];
     // Bin triangles by column so each column tests only nearby triangles.
     let mut bins: Vec<Vec<usize>> = vec![Vec::new(); n[0] * n[1]];
     for (t, tri) in mesh.tri.iter().enumerate() {
@@ -209,6 +230,10 @@ pub fn voxelize(mesh: &Mesh, h: f64) -> Grid {
         let x1 = ps.iter().map(|p| p[0]).fold(f64::MIN, f64::max);
         let y0 = ps.iter().map(|p| p[1]).fold(f64::MAX, f64::min);
         let y1 = ps.iter().map(|p| p[1]).fold(f64::MIN, f64::max);
+        // A triangle wholly beside the grid crosses none of its columns.
+        if x1 < origin[0] || y1 < origin[1] || x0 > origin[0] + n[0] as f64 * h || y0 > origin[1] + n[1] as f64 * h {
+            continue;
+        }
         let ci = |x: f64, a: usize| (((x - origin[a]) / h - 0.5).floor().max(0.0) as usize).min(n[a] - 1);
         let cj = |x: f64, a: usize| (((x - origin[a]) / h - 0.5).ceil().max(0.0) as usize).min(n[a] - 1);
         for j in ci(y0, 1)..=cj(y1, 1) {
@@ -228,18 +253,20 @@ pub fn voxelize(mesh: &Mesh, h: f64) -> Grid {
                     ray_z(mesh.pos[tri[0]], mesh.pos[tri[1]], mesh.pos[tri[2]], x, y)
                 })
                 .collect();
+            if zs.is_empty() {
+                continue;
+            }
             zs.sort_by(f64::total_cmp);
             for k in 0..n[2] {
                 let z = origin[2] + (k as f64 + 0.5) * h;
                 let below = zs.iter().filter(|v| **v < z).count();
                 if below % 2 == 1 {
-                    let id = grid.id(i, j, k);
-                    grid.inside[id] = true;
+                    inside[g.id(i, j, k)] = true;
                 }
             }
         }
     }
-    grid
+    inside
 }
 
 /// The geometry of a selected face.
@@ -485,19 +512,7 @@ impl<'a> Fem<'a> {
     }
 
     fn matvec(&self, stiff: &[f64], x: &[f64], y: &mut [f64]) {
-        add_work(self.dofs.len());
-        y.iter_mut().for_each(|v| *v = 0.0);
-        let ke = &self.brick.ke;
-        for (e, d) in self.dofs.iter().enumerate() {
-            let s = stiff[e];
-            let mut ue = [0.0; 24];
-            for (u, &da) in ue.iter_mut().zip(d.iter()) {
-                *u = x[da as usize];
-            }
-            for (row, &da) in ke.iter().zip(d.iter()) {
-                y[da as usize] += s * dot24(row, &ue);
-            }
-        }
+        apply_elements(&self.brick.ke, &self.dofs, stiff, x, y);
         for i in 0..self.ndof {
             if self.fixed[i] {
                 y[i] = x[i];
@@ -641,11 +656,24 @@ struct Prepared<'m, 'a> {
     inv_diag: Vec<Vec<f64>>,
 }
 
-fn level_matvec(brick: &Brick, l: &Level, stiff: &[f64], x: &[f64], y: &mut [f64]) {
-    add_work(l.dofs.len());
-    y.iter_mut().for_each(|v| *v = 0.0);
-    for (e, d) in l.dofs.iter().enumerate() {
-        let s = stiff[e];
+/// Elements per piece of [`apply_elements`]. The pieces, not the threads, fix the order of the
+/// sums, so the result is the same on every machine.
+const PIECE: usize = 8192;
+
+/// One piece's share of `K x`: the first dof it touches and its sums from there on.
+fn apply_piece(ke: &[[f64; 24]; 24], dofs: &[[u32; 24]], stiff: &[f64], x: &[f64]) -> (usize, Vec<f64>) {
+    let (mut lo, mut hi) = (usize::MAX, 0usize);
+    for d in dofs {
+        for &a in d {
+            lo = lo.min(a as usize);
+            hi = hi.max(a as usize);
+        }
+    }
+    if lo > hi {
+        return (0, Vec::new());
+    }
+    let mut y = vec![0.0; hi - lo + 1];
+    for (d, &s) in dofs.iter().zip(stiff) {
         if s == 0.0 {
             continue;
         }
@@ -653,10 +681,68 @@ fn level_matvec(brick: &Brick, l: &Level, stiff: &[f64], x: &[f64], y: &mut [f64
         for (u, &da) in ue.iter_mut().zip(d.iter()) {
             *u = x[da as usize];
         }
-        for (row, &da) in brick.ke.iter().zip(d.iter()) {
-            y[da as usize] += s * dot24(row, &ue);
+        for (row, &da) in ke.iter().zip(d.iter()) {
+            y[da as usize - lo] += s * dot24(row, &ue);
         }
     }
+    (lo, y)
+}
+
+/// How many threads to compute on.
+fn threads() -> usize {
+    #[cfg(target_arch = "wasm32")]
+    {
+        1
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        std::thread::available_parallelism().map_or(1, |n| n.get()).min(32)
+    }
+}
+
+/// `y = K x` without the supports, element by element, on all cores.
+fn apply_elements(ke: &[[f64; 24]; 24], dofs: &[[u32; 24]], stiff: &[f64], x: &[f64], y: &mut [f64]) {
+    add_work(dofs.len());
+    y.iter_mut().for_each(|v| *v = 0.0);
+    let pieces: Vec<(&[[u32; 24]], &[f64])> = dofs.chunks(PIECE).zip(stiff.chunks(PIECE)).collect();
+    let workers = threads().min(pieces.len());
+    let mut done: Vec<Option<(usize, Vec<f64>)>> = vec![None; pieces.len()];
+    if workers <= 1 {
+        for (slot, (d, s)) in done.iter_mut().zip(&pieces) {
+            *slot = Some(apply_piece(ke, d, s, x));
+        }
+    } else {
+        let pieces = &pieces;
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..workers)
+                .map(|w| {
+                    scope.spawn(move || {
+                        pieces.iter().enumerate().skip(w).step_by(workers).map(|(i, (d, s))| (i, apply_piece(ke, d, s, x))).collect::<Vec<_>>()
+                    })
+                })
+                .collect();
+            for h in handles {
+                // A worker only adds numbers; if one died all the same, its pieces are done here.
+                for (i, r) in h.join().unwrap_or_default() {
+                    done[i] = Some(r);
+                }
+            }
+        });
+        for (slot, (d, s)) in done.iter_mut().zip(pieces) {
+            if slot.is_none() {
+                *slot = Some(apply_piece(ke, d, s, x));
+            }
+        }
+    }
+    for (lo, part) in done.into_iter().flatten() {
+        for (t, v) in y[lo..].iter_mut().zip(part) {
+            *t += v;
+        }
+    }
+}
+
+fn level_matvec(brick: &Brick, l: &Level, stiff: &[f64], x: &[f64], y: &mut [f64]) {
+    apply_elements(&brick.ke, &l.dofs, stiff, x, y);
     for i in 0..l.ndof {
         if l.fixed[i] {
             y[i] = x[i];
@@ -1109,32 +1195,82 @@ fn organic(p: &Problem, s: &Settings, brick: &Brick, time_left: &mut dyn FnMut()
     let ne = elems.len();
     let fem = Fem::new(g, brick, elems.clone(), &p.fixed, &p.load, p.force);
     let e0 = s.material.modulus;
-    let emin = e0 * 1e-6;
+    let emin = e0 * 1e-4;
     let pen = 3.0;
     let keep: Vec<bool> = elems.iter().map(|&v| p.keep[v]).collect();
-    // Filter neighbourhood (radius 1.5 voxels).
-    let mut local = vec![usize::MAX; g.len()];
+    // Filter neighbourhood: a cone as wide as the thinnest member wanted, at least 1.5 voxels.
+    // It is what keeps the members from getting thinner than that.
+    let radius = (s.min_wall / g.h).clamp(1.5, 6.0);
+    let mut local = vec![u32::MAX; g.len()];
     for (e, &v) in elems.iter().enumerate() {
-        local[v] = e;
+        local[v] = e as u32;
     }
-    let mut nb = Vec::new();
-    let filt: Vec<Vec<(usize, f64)>> = elems
-        .iter()
-        .map(|&v| {
-            g.neighbours(v, &mut nb);
-            let mut l = vec![(local[v], 1.5)];
-            for &(w, d) in &nb {
-                if d < 1.5 && local[w] != usize::MAX {
-                    l.push((local[w], 1.5 - d));
+    let reach = radius.ceil() as i64;
+    let mut stencil: Vec<([i64; 3], f64)> = Vec::new();
+    for dk in -reach..=reach {
+        for dj in -reach..=reach {
+            for di in -reach..=reach {
+                let d = ((di * di + dj * dj + dk * dk) as f64).sqrt();
+                if d < radius {
+                    stencil.push(([di, dj, dk], radius - d));
                 }
             }
-            l
-        })
-        .collect();
+        }
+    }
+    let cells: Vec<[i64; 3]> = elems.iter().map(|&v| g.ijk(v).map(|c| c as i64)).collect();
+    let n = g.n.map(|c| c as i64);
+    // The filtered sensitivities, piece by piece on all cores.
+    let filter = |x: &[f64], dc: &[f64]| -> Vec<f64> {
+        let piece = |range: std::ops::Range<usize>| -> Vec<f64> {
+            range
+                .map(|e| {
+                    let c = cells[e];
+                    let (mut num, mut den) = (0.0, 0.0);
+                    for &(o, w) in &stencil {
+                        let q = [c[0] + o[0], c[1] + o[1], c[2] + o[2]];
+                        if q[0] < 0 || q[1] < 0 || q[2] < 0 || q[0] >= n[0] || q[1] >= n[1] || q[2] >= n[2] {
+                            continue;
+                        }
+                        let f = local[g.id(q[0] as usize, q[1] as usize, q[2] as usize)];
+                        if f != u32::MAX {
+                            num += w * x[f as usize] * dc[f as usize];
+                            den += w;
+                        }
+                    }
+                    num / (x[e].max(1e-3) * den)
+                })
+                .collect()
+        };
+        let ranges: Vec<std::ops::Range<usize>> = (0..ne).step_by(PIECE).map(|a| a..(a + PIECE).min(ne)).collect();
+        let workers = threads().min(ranges.len());
+        if workers <= 1 {
+            return ranges.into_iter().flat_map(piece).collect();
+        }
+        let (ranges, piece) = (&ranges, &piece);
+        let mut done: Vec<Vec<f64>> = vec![Vec::new(); ranges.len()];
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..workers)
+                .map(|w| {
+                    scope.spawn(move || ranges.iter().enumerate().skip(w).step_by(workers).map(|(i, r)| (i, piece(r.clone()))).collect::<Vec<_>>())
+                })
+                .collect();
+            for h in handles {
+                for (i, r) in h.join().unwrap_or_default() {
+                    done[i] = r;
+                }
+            }
+        });
+        for (slot, r) in done.iter_mut().zip(ranges) {
+            if slot.len() != r.len() {
+                *slot = piece(r.clone());
+            }
+        }
+        done.into_iter().flatten().collect()
+    };
 
     let schedule: Vec<f64> = match s.volume {
         Some(v) => vec![v.clamp(0.05, 1.0)],
-        None => vec![0.5, 0.4, 0.32, 0.26, 0.21, 0.17, 0.14, 0.11],
+        None => vec![0.5, 0.4, 0.32, 0.26, 0.21, 0.17, 0.14, 0.11, 0.09, 0.075, 0.062, 0.051, 0.042, 0.035, 0.029, 0.024, 0.02],
     };
     let mut x = vec![schedule[0]; ne];
     for e in 0..ne {
@@ -1162,20 +1298,11 @@ fn organic(p: &Problem, s: &Settings, brick: &Brick, time_left: &mut dyn FnMut()
             }
             iterations += 1;
             let stiff: Vec<f64> = x.iter().map(|xe| (emin + xe.powf(pen) * (e0 - emin)) * g.h).collect();
-            fem.solve(&stiff, &mut u, 5e-3, 200);
+            fem.solve(&stiff, &mut u, 5e-3, 40);
             let en = fem.energies(&u);
             let dc: Vec<f64> = (0..ne).map(|e| -pen * x[e].powf(pen - 1.0) * (e0 - emin) * g.h * en[e]).collect();
             // Sensitivity filter.
-            let dcf: Vec<f64> = (0..ne)
-                .map(|e| {
-                    let (mut num, mut den) = (0.0, 0.0);
-                    for &(f, w) in &filt[e] {
-                        num += w * x[f] * dc[f];
-                        den += w;
-                    }
-                    num / (x[e].max(1e-3) * den)
-                })
-                .collect();
+            let dcf = filter(&x, &dc);
             // Optimality criteria update.
             let target = vf * ne as f64;
             let (mut l1, mut l2) = (0.0f64, 1e12f64);
@@ -1421,7 +1548,72 @@ fn lattice(p: &Problem, s: &Settings, brick: &Brick, time_left: &mut dyn FnMut()
 /// Exact cuts the surface keeps: hole cylinders (origin, unit axis, radius).
 pub type Cut = (V3, V3, f64);
 
-pub fn surface(g: &Grid, field: &[f64], up: usize, smooth_iters: usize, cuts: &[Cut], clip: Option<(V3, V3)>) -> Mesh {
+/// A half-space the surface stays in: a point on its plane and the normal pointing into it.
+pub type HalfSpace = (V3, V3);
+
+/// Distance from `p` to triangle `t`.
+pub fn point_triangle_distance(p: V3, t: &[V3; 3]) -> f64 {
+    let (a, b, c) = (t[0], t[1], t[2]);
+    let (ab, ac, ap) = (sub(b, a), sub(c, a), sub(p, a));
+    let (d1, d2) = (dot(ab, ap), dot(ac, ap));
+    let at = |q: V3| norm(sub(p, q));
+    let along = |o: V3, d: V3, t: f64| [o[0] + t * d[0], o[1] + t * d[1], o[2] + t * d[2]];
+    if d1 <= 0.0 && d2 <= 0.0 {
+        return at(a);
+    }
+    let bp = sub(p, b);
+    let (d3, d4) = (dot(ab, bp), dot(ac, bp));
+    if d3 >= 0.0 && d4 <= d3 {
+        return at(b);
+    }
+    let vc = d1 * d4 - d3 * d2;
+    if vc <= 0.0 && d1 >= 0.0 && d3 <= 0.0 {
+        return at(along(a, ab, d1 / (d1 - d3)));
+    }
+    let cp = sub(p, c);
+    let (d5, d6) = (dot(ab, cp), dot(ac, cp));
+    if d6 >= 0.0 && d5 <= d6 {
+        return at(c);
+    }
+    let vb = d5 * d2 - d1 * d6;
+    if vb <= 0.0 && d2 >= 0.0 && d6 <= 0.0 {
+        return at(along(a, ac, d2 / (d2 - d6)));
+    }
+    let va = d3 * d6 - d5 * d4;
+    if va <= 0.0 && (d4 - d3) >= 0.0 && (d5 - d6) >= 0.0 {
+        return at(along(b, sub(c, b), (d4 - d3) / ((d4 - d3) + (d5 - d6))));
+    }
+    let denom = va + vb + vc;
+    if !(denom.abs() > 0.0) {
+        return at(a);
+    }
+    let (v, w) = (vb / denom, vc / denom);
+    at([a[0] + ab[0] * v + ac[0] * w, a[1] + ab[1] * v + ac[1] * w, a[2] + ab[2] * v + ac[2] * w])
+}
+
+/// The design voxels whose centre lies within `reach` of the triangles of a face.
+pub fn voxels_near(g: &Grid, tris: &[[V3; 3]], reach: f64) -> Vec<usize> {
+    let (mut lo, mut hi) = ([f64::MAX; 3], [f64::MIN; 3]);
+    for t in tris {
+        for p in t {
+            for a in 0..3 {
+                lo[a] = lo[a].min(p[a] - reach);
+                hi[a] = hi[a].max(p[a] + reach);
+            }
+        }
+    }
+    (0..g.len())
+        .filter(|&v| {
+            if !g.inside[v] {
+                return false;
+            }
+            let c = g.center(v);
+            (0..3).all(|a| c[a] >= lo[a] && c[a] <= hi[a]) && tris.iter().any(|t| point_triangle_distance(c, t) <= reach)
+        })
+        .collect()
+}
+
+pub fn surface(g: &Grid, field: &[f64], up: usize, smooth_iters: usize, cuts: &[Cut], clip: Option<(V3, V3)>, within: &[HalfSpace]) -> Mesh {
     let up = up.max(1);
     // Padded sample grid: voxel centres with one empty layer around, refined `up` times.
     // Samples sit a quarter step off the voxel centres and faces, so a 0/1 field never puts one
@@ -1462,6 +1654,12 @@ pub fn surface(g: &Grid, field: &[f64], up: usize, smooth_iters: usize, cuts: &[
                     let p = [0, 1, 2].map(|a| g.origin[a] + (f[a] + 0.5) * g.h);
                     for (o, ax, r) in cuts {
                         v = v.min((axis_dist(p, *o, *ax) - r) / (2.0 * g.h));
+                    }
+                }
+                if !within.is_empty() {
+                    let p = [0, 1, 2].map(|a| g.origin[a] + (f[a] + 0.5) * g.h);
+                    for (point, normal) in within {
+                        v = v.min(dot(sub(p, *point), unit(*normal)) / (2.0 * g.h));
                     }
                 }
                 if let Some((lo, hi)) = clip {
@@ -1662,7 +1860,7 @@ mod tests {
         let s = settings(style);
         let t = std::time::Instant::now();
         let out = generate(&p, &s, &mut || t.elapsed().as_secs_f64() < 60.0).unwrap();
-        let m = surface(&p.grid, &out.field, 2, 6, &[], None);
+        let m = surface(&p.grid, &out.field, 2, 6, &[], None, &[]);
         println!(
             "{style:?} h={h}: {} voxels, {} of {} solid, stress {:.1}/{:.1}, defl {:.3}, passed {}, {} it, {:.2}s, mesh {} tris vol {:.0} {:?}",
             p.grid.inside.iter().filter(|v| **v).count(),
@@ -1700,7 +1898,7 @@ mod tests {
         let p = problem(2.36);
         let s = settings(Style::Lattice);
         let out = generate(&p, &s, &mut || true).unwrap();
-        let m = surface(&p.grid, &out.field, 3, 0, &[], None);
+        let m = surface(&p.grid, &out.field, 3, 0, &[], None, &[]);
         // Weld by rounded position, as SolidCraft does.
         let mut ids = std::collections::HashMap::new();
         let key = |p: V3| p.map(|v| (v * 100.0).round() as i64);
@@ -1733,7 +1931,7 @@ mod tests {
     fn surface_of_box_is_closed() {
         let p = problem(5.0);
         let field: Vec<f64> = p.grid.inside.iter().map(|v| if *v { 1.0 } else { 0.0 }).collect();
-        let m = surface(&p.grid, &field, 2, 0, &[], None);
+        let m = surface(&p.grid, &field, 2, 0, &[], None, &[]);
         // Every edge used exactly twice, in opposite directions.
         let mut edges = std::collections::HashMap::new();
         for t in &m.tri {

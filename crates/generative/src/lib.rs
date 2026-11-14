@@ -10,6 +10,7 @@
 // Finite-element loops index several arrays by the same element or degree of freedom.
 #![allow(clippy::needless_range_loop)]
 
+pub mod study;
 pub mod truss;
 pub mod voxel;
 

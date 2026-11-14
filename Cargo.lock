@@ -5901,6 +5901,7 @@ dependencies = [
  "solidcraft-color",
  "solidcraft-control",
  "solidcraft-doc",
+ "solidcraft-generative",
  "solidcraft-geom",
  "solidcraft-io",
  "solidcraft-kernel",

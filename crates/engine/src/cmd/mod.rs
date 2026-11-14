@@ -81,6 +81,7 @@ mod design_link;
 mod file;
 mod frame;
 mod frame_end_cap;
+mod generative;
 pub(crate) mod inspect;
 mod interference;
 pub(crate) mod joints;
@@ -371,6 +372,7 @@ pub fn command_specs() -> Vec<&'static CommandSpec> {
     v.extend(features_more::COMMANDS.iter());
     v.extend(cell_grid::COMMANDS.iter());
     v.extend(mesh::COMMANDS.iter());
+    v.extend(generative::COMMANDS.iter());
     v.extend(construct_auto::COMMANDS.iter());
     v.extend(plugin::COMMANDS.iter());
     v.extend(construct::COMMANDS.iter());
