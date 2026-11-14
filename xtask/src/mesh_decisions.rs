@@ -42,6 +42,7 @@ pub const SKIPPED_MODULES: &[(&str, &str)] = &[
     ("crates/doc/src/point_cloud_complex.rs", "no mesh: the triangles of a point cloud's own complex"),
     ("crates/doc/src/point_cloud_distribution.rs", "no mesh: the triangles of a point cloud's own complex"),
     ("crates/engine/src/cmd/file_thumbnail.rs", "a design's thumbnail picture"),
+    ("crates/engine/src/cmd/generative.rs", "mesh bodies: a generative design is a mesh body grown on a voxel grid around the bodies' triangles"),
     ("crates/engine/src/cmd/mesh.rs", "mesh bodies: repair, decimate and inspect imported meshes"),
     ("crates/engine/src/cmd/render", "rendered pictures"),
     ("crates/engine/src/cmd/render.rs", "rendered pictures"),
