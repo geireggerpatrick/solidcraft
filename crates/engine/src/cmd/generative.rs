@@ -158,13 +158,16 @@ fn design(s: &mut Session, p: &Value) -> Result<Value> {
         return Err(bad(CMD, "the result has too many triangles; give fewer `voxels`"));
     }
     let name = q.body_name.as_deref().map(str::trim).filter(|n| !n.is_empty()).unwrap_or("Generative").to_string();
-    let data = MeshData {
+    let mut data = MeshData {
         name,
         positions: mesh.pos.iter().flatten().copied().collect(),
         triangles: mesh.tri.iter().flatten().map(|v| *v as u32).collect(),
         corner_normals: Default::default(),
         color: None,
     };
+    // Shaded as the round shape it is, not as its triangles: only the flat cuts on the picked
+    // faces keep their edge.
+    data.generate_crease_normals(50.0).map_err(|e| bad(CMD, e.to_string()))?;
     let mut reply = add_feature(s, p, FeatureKind::MeshImport { file: "generative design".into(), meshes: vec![data] })?;
     if let Some(o) = reply.as_object_mut() {
         if !outcome.passed {

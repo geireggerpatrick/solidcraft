@@ -39,6 +39,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
     }
+    // A slanted round bar as a smooth field, to look at the surface alone.
+    if case == "tube" {
+        let g = solidcraft_generative::voxel::box_grid([0.0; 3], [40.0; 3], 1.0);
+        let dir = [0.48, 0.6, 0.64];
+        let field: Vec<f64> = (0..g.len())
+            .map(|v| {
+                let c = g.center(v).map(|x| x - 20.0);
+                let along = c[0] * dir[0] + c[1] * dir[1] + c[2] * dir[2];
+                let off = (c[0] * c[0] + c[1] * c[1] + c[2] * c[2] - along * along).max(0.0).sqrt();
+                (0.5 + (wall - off) / 3.0).clamp(0.0, 1.0) * if along.abs() < 14.0 { 1.0 } else { 0.0 }
+            })
+            .collect();
+        let mesh = solidcraft_generative::voxel::surface(&g, &field, voxels.max(1.0) as usize, 40, &[], None, &[]);
+        return write_stl(out, &mesh);
+    }
     let deflection: f64 = args.get(8).and_then(|v| v.parse().ok()).unwrap_or(0.0);
     let mut force = [0.0, 0.0, -newtons];
     let (held, load, obstacles): (Vec<Vec<[V3; 3]>>, Vec<Vec<[V3; 3]>>, Vec<Mesh>) = match case {
@@ -108,13 +123,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         t.elapsed().as_secs_f64()
     );
     println!("notes {:?}", o.note);
+    write_stl(out, &r.mesh)
+}
+
+fn write_stl(out: &str, mesh: &Mesh) -> Result<(), Box<dyn std::error::Error>> {
     let mut f = std::io::BufWriter::new(std::fs::File::create(out)?);
     f.write_all(&[0u8; 80])?;
-    f.write_all(&(r.mesh.tri.len() as u32).to_le_bytes())?;
-    for t in &r.mesh.tri {
+    f.write_all(&(mesh.tri.len() as u32).to_le_bytes())?;
+    for t in &mesh.tri {
         f.write_all(&[0u8; 12])?;
         for v in t {
-            for c in r.mesh.pos[*v] {
+            for c in mesh.pos[*v] {
                 f.write_all(&(c as f32).to_le_bytes())?;
             }
         }

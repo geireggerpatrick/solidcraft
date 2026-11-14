@@ -125,6 +125,230 @@ fn faces(list: &[FaceTris], flat: bool) -> Vec<Face<'_>> {
     list.iter().map(|tris| Face { tris, plane: if flat { plane_of(tris) } else { None } }).collect()
 }
 
+/// The sides of a face's triangles that only one triangle has: the face's outline.
+fn outline_of(tris: &[[V3; 3]]) -> Vec<[V3; 2]> {
+    let same = |a: V3, b: V3| (0..3).all(|x| (a[x] - b[x]).abs() < 1e-6);
+    let sides: Vec<[V3; 2]> = tris.iter().flat_map(|t| [[t[0], t[1]], [t[1], t[2]], [t[2], t[0]]]).collect();
+    sides
+        .iter()
+        .enumerate()
+        .filter(|(i, s)| {
+            !sides.iter().enumerate().any(|(j, o)| *i != j && ((same(s[0], o[0]) && same(s[1], o[1])) || (same(s[0], o[1]) && same(s[1], o[0]))))
+        })
+        .map(|(_, s)| *s)
+        .collect()
+}
+
+/// How far a point is from the segment `a`-`b`.
+fn segment_distance(p: V3, a: V3, b: V3) -> f64 {
+    let ab = sub(b, a);
+    let along = (dot(sub(p, a), ab) / dot(ab, ab).max(1e-300)).clamp(0.0, 1.0);
+    let off = sub(p, [0, 1, 2].map(|x| a[x] + along * ab[x]));
+    dot(off, off).sqrt()
+}
+
+/// One resolution of a study: the problem on its grid, and how its surface is cut.
+struct Level {
+    problem: Problem,
+    clip: Option<(V3, V3)>,
+    within: Vec<HalfSpace>,
+    /// For each flat picked face its plane and the voxels behind it, which stand for the
+    /// face's body.
+    slabs: Vec<(HalfSpace, Vec<usize>)>,
+    /// The radius of the fillets into those bodies, in voxels.
+    round: f64,
+}
+
+/// The box a study builds in, and the volume of its design space.
+fn extent(study: &Study, held: &[Face], load: &[Face]) -> Result<(V3, V3, f64), String> {
+    if let Some(mesh) = &study.space {
+        let volume = gv::mesh_volume(mesh).abs();
+        if !(volume > 1e-6) {
+            return Err("the design space must be a closed body".into());
+        }
+        let (lo, hi) = mesh.bbox();
+        return Ok((lo, hi, volume));
+    }
+    let (mut lo, mut hi) = ([f64::MAX; 3], [f64::MIN; 3]);
+    for p in held.iter().chain(load).flat_map(|f| f.tris.iter().flatten()) {
+        for a in 0..3 {
+            lo[a] = lo[a].min(p[a] - study.margin);
+            hi[a] = hi[a].max(p[a] + study.margin);
+        }
+    }
+    // Faces in one plane span a flat box: give it some depth to build an arch in.
+    let longest = (0..3).map(|a| hi[a] - lo[a]).fold(0.0, f64::max);
+    if !(longest > 1e-3 && longest < 1e5) {
+        return Err("the picked faces span no space to build in".into());
+    }
+    for a in 0..3 {
+        let grow = (0.3 * longest - (hi[a] - lo[a])) / 2.0;
+        if grow > 0.0 {
+            lo[a] -= grow;
+            hi[a] += grow;
+        }
+    }
+    Ok((lo, hi, (0..3).map(|a| hi[a] - lo[a]).product::<f64>()))
+}
+
+/// The study's problem on a grid of about `voxels` cells, for members `wall` mm thick. With
+/// `band`, a coarser level's grid and the cells around its structure, only the cells there are
+/// design space: a finer level works the structure out where the coarser one found it.
+fn level(study: &Study, held: &[Face], load: &[Face], voxels: f64, wall: f64, band: Option<(&Grid, &[bool])>) -> Result<Level, String> {
+    let boxed = study.space.is_none();
+    let (lo, hi, volume) = extent(study, held, load)?;
+    let h = (volume / voxels).cbrt().max(0.05);
+    // A member runs into a picked face's body with a fillet twice as wide as the thinnest member.
+    let round = (2.0 * wall / h).clamp(2.0, 7.0);
+    // The design space and its grid.
+    let (mut grid, clip, within): (Grid, Option<(V3, V3)>, Vec<HalfSpace>) = match &study.space {
+        Some(mesh) => {
+            let cells = (0..3).map(|a| ((hi[a] - lo[a]) / h).ceil().max(1.0)).product::<f64>();
+            if !(cells <= MAX_CELLS as f64) {
+                return Err("the design space is too thin for this many cells; give fewer".into());
+            }
+            (gv::voxelize(mesh, h), Some((lo, hi)), Vec::new())
+        }
+        None => {
+            // Layers all around the box: behind a picked face they lie in the face's body and
+            // stand for it, as deep as a fillet is wide. The structure is cut flat on the face.
+            let pad = round.ceil() + 1.0;
+            let cells = (0..3).map(|a| ((hi[a] - lo[a]) / h).ceil() + 2.0 * pad).product::<f64>();
+            if !(cells <= MAX_CELLS as f64) {
+                return Err("too many cells; give fewer".into());
+            }
+            let mut grid = gv::box_grid(lo.map(|c| c - pad * h), hi.map(|c| c + pad * h), h);
+            for v in 0..grid.len() {
+                let c = grid.center(v);
+                if (0..3).any(|a| c[a] < lo[a] - h || c[a] > hi[a] + h) {
+                    grid.inside[v] = false;
+                }
+            }
+            let within = held.iter().chain(load).filter_map(|f| f.plane).map(|(pt, n)| ([0, 1, 2].map(|a| pt[a] - OVERLAP * n[a]), n)).collect();
+            (grid, None, within)
+        }
+    };
+    let mut blocked = vec![false; grid.len()];
+    for mesh in &study.obstacles {
+        let mask = gv::mesh_mask(&grid, mesh);
+        for v in 0..grid.len() {
+            if mask[v] {
+                grid.inside[v] = false;
+                blocked[v] = true;
+            }
+        }
+    }
+    if let Some((coarse, around)) = band {
+        for v in 0..grid.len() {
+            if grid.inside[v] && !coarse.at(grid.center(v)).is_some_and(|w| around[w]) {
+                grid.inside[v] = false;
+            }
+        }
+    }
+    let mut slabs: Vec<(HalfSpace, Vec<usize>)> = Vec::new();
+    let mut cover = vec![false; grid.len()];
+    if boxed {
+        // Nothing is built on the far side of a picked face's plane.
+        for (point, normal) in &within {
+            for v in 0..grid.len() {
+                if dot(sub(grid.center(v), *point), *normal) < -0.9 * h {
+                    grid.inside[v] = false;
+                }
+            }
+        }
+        // The layers behind a flat picked face, in its body, belong to the structure: they are
+        // what the cut on the face's plane leaves flat. Beside the face, the layer in front of
+        // the plane stays empty: the structure meets the plane on the face only and does not
+        // hang over the face's edges. On a face that is not small it also stays a member's
+        // width away from the face's outline, which leaves room for the fillet around it.
+        let deep = (round.ceil() + 0.5) * h;
+        let mut on_face = vec![false; grid.len()];
+        let mut beside = vec![false; grid.len()];
+        for f in held.iter().chain(load) {
+            let Some((point, normal)) = f.plane else { continue };
+            let area: f64 = f.tris.iter().map(|t| 0.5 * dot(cross(sub(t[1], t[0]), sub(t[2], t[0])), normal).abs()).sum();
+            // A small face is covered whole, so the structure grows out of its outline.
+            let small = area <= 25.0 * wall * wall;
+            let outline = outline_of(f.tris);
+            let inset = if small { 0.0 } else { wall.min(0.25 * area.sqrt()) };
+            let mut behind = Vec::new();
+            let mut front = Vec::new();
+            // A face narrower than a cell still gets the cells along it.
+            for reach in [0.3 * h, 0.9 * h] {
+                behind.clear();
+                front.clear();
+                for v in 0..grid.len() {
+                    let c = grid.center(v);
+                    let depth = dot(sub(c, point), normal);
+                    if !(depth > -deep && depth < 1.25 * h) {
+                        continue;
+                    }
+                    let foot = [0, 1, 2].map(|a| c[a] - depth * normal[a]);
+                    let aside = f.tris.iter().map(|t| gv::point_triangle_distance(foot, t)).fold(f64::MAX, f64::min);
+                    if aside <= reach && depth < 0.0 {
+                        behind.push(v);
+                    } else if aside <= reach && !(inset > 0.0 && outline.iter().any(|[a, b]| segment_distance(foot, *a, *b) < inset)) {
+                        on_face[v] = true;
+                        if small && depth < h {
+                            front.push(v);
+                        }
+                    } else if depth > -0.9 * h {
+                        beside[v] = true;
+                    }
+                }
+                if !behind.is_empty() {
+                    break;
+                }
+            }
+            for v in front {
+                cover[v] = !blocked[v];
+            }
+            slabs.push(((point, normal), behind));
+        }
+        for v in 0..grid.len() {
+            if beside[v] && !on_face[v] {
+                grid.inside[v] = false;
+            }
+            if cover[v] {
+                grid.inside[v] = true;
+            }
+        }
+        for (_, behind) in &slabs {
+            for &v in behind {
+                grid.inside[v] = true;
+            }
+        }
+    }
+    // A flat picked face is held or loaded through the cells behind it, inside its body: they
+    // stand for the body, which spreads the force over the face, and are cut off again at the
+    // end. So the structure meets the face only where it needs to. A curved face is held or
+    // loaded through the cells in front of it, which stay.
+    let mut flat = slabs.iter();
+    let mut mark = |faces: &[Face]| -> (Vec<bool>, Vec<Vec<usize>>) {
+        let mut set = vec![false; grid.len()];
+        let mut each = Vec::new();
+        for f in faces {
+            let near = match (f.plane, flat.next()) {
+                (Some(_), Some((_, behind))) => behind.clone(),
+                _ => gv::voxels_near(&grid, f.tris, 0.9 * h),
+            };
+            for &v in &near {
+                set[v] = true;
+            }
+            each.push(near);
+        }
+        (set, each)
+    };
+    let (fixed, supports) = mark(held);
+    let (loaded, loads) = mark(load);
+    if supports.iter().any(Vec::is_empty) || loads.iter().any(Vec::is_empty) {
+        return Err("a picked face has no room to build on; give more cells or a margin".into());
+    }
+    let both: Vec<bool> = fixed.iter().zip(&loaded).map(|(a, b)| *a || *b).collect();
+    let keep = if boxed { both.iter().zip(&cover).map(|(a, b)| *a || *b).collect() } else { gv::dilate(&grid, &both, 1.5) };
+    Ok(Level { problem: Problem { grid, fixed, load: loaded, keep, supports, loads, force: study.force }, clip, within, slabs, round })
+}
+
 /// Runs the study. `time_left` is asked between steps; when it says no, the best shape so far
 /// is finished.
 pub fn run(study: &Study, time_left: &mut dyn FnMut() -> bool) -> Result<Report, String> {
@@ -137,170 +361,75 @@ pub fn run(study: &Study, time_left: &mut dyn FnMut() -> bool) -> Result<Report,
     let boxed = study.space.is_none();
     let held = faces(&study.held, boxed);
     let load = faces(&study.load, boxed);
-
-    // The design space and its grid.
-    let (mut grid, clip, within): (Grid, Option<(V3, V3)>, Vec<HalfSpace>) = match &study.space {
-        Some(mesh) => {
-            let volume = gv::mesh_volume(mesh).abs();
-            if !(volume > 1e-6) {
-                return Err("the design space must be a closed body".into());
-            }
-            let h = (volume / study.voxels).cbrt().max(0.05);
-            let (lo, hi) = mesh.bbox();
-            let cells = (0..3).map(|a| ((hi[a] - lo[a]) / h).ceil().max(1.0)).product::<f64>();
-            if !(cells <= MAX_CELLS as f64) {
-                return Err("the design space is too thin for this many cells; give fewer".into());
-            }
-            (gv::voxelize(mesh, h), Some((lo, hi)), Vec::new())
-        }
-        None => {
-            let (mut lo, mut hi) = ([f64::MAX; 3], [f64::MIN; 3]);
-            for p in held.iter().chain(&load).flat_map(|f| f.tris.iter().flatten()) {
-                for a in 0..3 {
-                    lo[a] = lo[a].min(p[a] - study.margin);
-                    hi[a] = hi[a].max(p[a] + study.margin);
-                }
-            }
-            // Faces in one plane span a flat box: give it some depth to build an arch in.
-            let longest = (0..3).map(|a| hi[a] - lo[a]).fold(0.0, f64::max);
-            if !(longest > 1e-3 && longest < 1e5) {
-                return Err("the picked faces span no space to build in".into());
-            }
-            for a in 0..3 {
-                let grow = (0.3 * longest - (hi[a] - lo[a])) / 2.0;
-                if grow > 0.0 {
-                    lo[a] -= grow;
-                    hi[a] += grow;
-                }
-            }
-            let volume = (0..3).map(|a| hi[a] - lo[a]).product::<f64>();
-            let h = (volume / study.voxels).cbrt().max(0.05);
-            // One more layer all around: behind a picked face it lies in the face's body, and
-            // the structure is cut flat on the face there.
-            let cells = (0..3).map(|a| ((hi[a] - lo[a]) / h).ceil() + 2.0).product::<f64>();
-            if !(cells <= MAX_CELLS as f64) {
-                return Err("too many cells; give fewer".into());
-            }
-            let grid = gv::box_grid(lo.map(|c| c - h), hi.map(|c| c + h), h);
-            let within = held.iter().chain(&load).filter_map(|f| f.plane).map(|(pt, n)| ([0, 1, 2].map(|a| pt[a] - OVERLAP * n[a]), n)).collect();
-            (grid, None, within)
-        }
-    };
-    let h = grid.h;
-    for mesh in &study.obstacles {
-        let mask = gv::mesh_mask(&grid, mesh);
-        for (inside, blocked) in grid.inside.iter_mut().zip(mask) {
-            if blocked {
-                *inside = false;
-            }
-        }
+    // An organic structure is found on a coarse grid first and worked out on finer ones, each
+    // with eight times the cells but only around the structure the one before found: fine
+    // members at a fraction of the work a fine grid all over would be.
+    let mut sizes = vec![study.voxels];
+    while study.settings.style == gv::Style::Organic && sizes.len() < 3 && sizes[sizes.len() - 1] / 8.0 >= 12_000.0 {
+        sizes.push(sizes[sizes.len() - 1] / 8.0);
     }
-    if boxed {
-        // Nothing is built on the far side of a picked face's plane.
-        for (point, normal) in &within {
-            for v in 0..grid.len() {
-                if dot(sub(grid.center(v), *point), *normal) < -0.9 * h {
-                    grid.inside[v] = false;
-                }
-            }
-        }
-        // The layer just behind a flat picked face, in its body, belongs to the structure: it
-        // is what the cut on the face's plane leaves flat. Beside the face, that layer and the
-        // one in front of the plane stay empty: the structure meets the plane on the face only
-        // and does not hang over the face's edges.
-        let mut on_face = vec![false; grid.len()];
-        let mut behind = vec![false; grid.len()];
-        let mut beside = vec![false; grid.len()];
-        for f in held.iter().chain(&load) {
-            let Some((point, normal)) = f.plane else { continue };
-            // A face narrower than a cell still gets the cells along it.
-            for reach in [0.3 * h, 0.9 * h] {
-                let mut found = false;
-                for v in 0..grid.len() {
-                    let c = grid.center(v);
-                    let depth = dot(sub(c, point), normal);
-                    if !(depth > -0.9 * h && depth < 1.25 * h) {
-                        continue;
-                    }
-                    let foot = [0, 1, 2].map(|a| c[a] - depth * normal[a]);
-                    if f.tris.iter().any(|t| gv::point_triangle_distance(foot, t) <= reach) {
-                        on_face[v] = true;
-                        if depth < 0.0 {
-                            behind[v] = true;
-                            found = true;
-                        }
-                    } else {
-                        beside[v] = true;
-                    }
-                }
-                if found {
-                    break;
-                }
-            }
-        }
-        for v in 0..grid.len() {
-            if behind[v] {
-                grid.inside[v] = true;
-            } else if beside[v] && !on_face[v] {
-                grid.inside[v] = false;
-            }
-        }
-    }
-    // A flat picked face is held or loaded through the layer of cells just behind it, inside
-    // its body: that layer stands for the body, which spreads the force over the face, and is
-    // cut off again at the end. So the structure meets the face only where it needs to. A
-    // curved face is held or loaded through the cells in front of it, which stay.
-    let mark = |faces: &[Face]| -> (Vec<bool>, Vec<Vec<usize>>) {
-        let mut set = vec![false; grid.len()];
-        let mut each = Vec::new();
-        for f in faces {
-            let mut near = gv::voxels_near(&grid, f.tris, 0.9 * h);
-            if let Some((point, normal)) = f.plane {
-                near.retain(|&v| dot(sub(grid.center(v), point), normal) < 0.0);
-            }
-            for &v in &near {
-                set[v] = true;
-            }
-            each.push(near);
-        }
-        (set, each)
-    };
-    let (fixed, supports) = mark(&held);
-    let (loaded, loads) = mark(&load);
-    if supports.iter().any(Vec::is_empty) || loads.iter().any(Vec::is_empty) {
-        return Err("a picked face has no room to build on; give more cells or a margin".into());
-    }
-    let both: Vec<bool> = fixed.iter().zip(&loaded).map(|(a, b)| *a || *b).collect();
-    let keep = if boxed { both.clone() } else { gv::dilate(&grid, &both, 1.5) };
-    let problem = Problem { grid, fixed, load: loaded, keep, supports, force: study.force };
-    // With no thinnest member given: 4 % of the design space's longest side, which gives few,
-    // sturdy members rather than many hair-thin ones.
+    sizes.reverse();
     let mut settings = study.settings.clone();
+    let (lo, hi, volume) = extent(study, &held, &load)?;
+    let longest = (0..3).map(|a| hi[a] - lo[a]).fold(0.0, f64::max);
+    // With no thinnest member given: two and a half cells of the finest grid, and at least
+    // 1.5 % of the design space's longest side. Finer cells give finer members.
     if !(settings.min_wall > 0.0) {
-        let longest = (0..3).map(|a| problem.grid.n[a] as f64 * h).fold(0.0, f64::max);
-        settings.min_wall = 0.04 * longest;
+        settings.min_wall = (2.5 * (volume / study.voxels).cbrt().max(0.05)).max(0.015 * longest);
     }
-    // With no limit given, the loaded faces may move by 1/400 of the longest side: a shape that
+    // With no limit given, the loaded faces may move by 1/300 of the longest side: a shape that
     // only just does not break is too soft to be of use.
     if !(settings.max_deflection > 0.0) {
-        let longest = (0..3).map(|a| problem.grid.n[a] as f64 * h).fold(0.0, f64::max);
-        settings.max_deflection = longest / 400.0;
+        settings.max_deflection = longest / 300.0;
     }
-    let outcome = gv::generate(&problem, &settings, time_left)?;
-    let g = &problem.grid;
-    let mut field = outcome.field.clone();
-    // The layer behind a flat face takes the shape of what stands on it, so the structure
-    // runs straight into the cut on the face's plane.
-    for f in held.iter().chain(&load) {
-        let Some((point, normal)) = f.plane else { continue };
-        for v in gv::voxels_near(g, f.tris, 0.9 * h) {
-            let c = g.center(v);
-            let depth = dot(sub(c, point), normal);
-            if depth >= 0.0 {
-                continue;
+    let mut done: Option<(Level, Outcome)> = None;
+    for &voxels in &sizes {
+        let around = done.as_ref().map(|(l, o)| {
+            let solid: Vec<bool> = o.field.iter().map(|f| *f > 0.5).collect();
+            gv::dilate(&l.problem.grid, &solid, 2.5)
+        });
+        let band = done.as_ref().zip(around.as_deref()).map(|((l, _), a)| (&l.problem.grid, a));
+        let next = level(study, &held, &load, voxels, settings.min_wall, band)?;
+        let g = &next.problem.grid;
+        let outcome = match &done {
+            None => gv::generate(&next.problem, &settings, time_left)?,
+            Some((before, coarse)) => {
+                let from = &before.problem.grid;
+                let start: Vec<f64> = (0..g.len()).map(|v| from.at(g.center(v)).map_or(0.0, |w| coarse.field[w])).collect();
+                match gv::refine(&next.problem, &settings, &start, time_left) {
+                    // What the finer grid cannot carry stays as the coarser one found it.
+                    Ok(fine) if fine.passed || !coarse.passed => fine,
+                    _ => break,
+                }
             }
-            let front = [0, 1, 2].map(|a| c[a] + (0.5 * h - depth) * normal[a]);
-            field[v] = g.at(front).filter(|&w| g.inside[w]).map_or(0.0, |w| outcome.field[w]);
+        };
+        done = Some((next, outcome));
+        if !time_left() {
+            break;
+        }
+    }
+    let (Level { problem, clip, within, slabs, round }, outcome) = done.ok_or("no structure came out")?;
+    let g = &problem.grid;
+    let h = g.h;
+    let mut field = outcome.field.clone();
+    if study.settings.style == gv::Style::Organic {
+        gv::polish(g, &mut field);
+    }
+    if !slabs.is_empty() {
+        let mut slab = vec![false; g.len()];
+        for &v in slabs.iter().flat_map(|(_, behind)| behind) {
+            slab[v] = true;
+        }
+        gv::fillet(g, &mut field, &slab, round);
+        // The cells behind a flat face take the shape of what stands on it, so the structure
+        // runs straight into the cut on the face's plane.
+        for ((point, normal), behind) in &slabs {
+            for &v in behind {
+                let c = g.center(v);
+                let depth = dot(sub(c, *point), *normal);
+                let front = [0, 1, 2].map(|a| c[a] + (0.5 * h - depth) * normal[a]);
+                field[v] = g.at(front).filter(|&w| g.inside[w] && !slab[w]).map_or(0.0, |w| field[w]);
+            }
         }
     }
     let up = if g.len() > 400_000 { 1 } else { 2 };
