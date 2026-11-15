@@ -65,7 +65,7 @@ fn a_large_meshs_levels_are_made_once_on_a_worker() {
 }
 
 /// A smoothly shaded mesh has smoothly shaded levels: on a sphere every corner of a level is
-/// lit straight away from the centre (within a degree), where its triangles' own normals are
+/// lit straight away from the centre (within two degrees), where its triangles' own normals are
 /// several degrees off and would show as facets.
 #[test]
 fn a_smooth_meshs_levels_are_shaded_smoothly() {

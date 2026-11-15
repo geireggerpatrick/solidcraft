@@ -3151,7 +3151,10 @@ mod tests {
         };
         let (along_held, along_sliding) = (deflection([-300.0, 0.0, 0.0], false), deflection([-300.0, 0.0, 0.0], true));
         let (across_held, across_sliding) = (deflection([0.0, 0.0, -300.0], false), deflection([0.0, 0.0, -300.0], true));
-        assert!(along_sliding > 0.5 * along_held && along_sliding < 3.0 * along_held, "{along_sliding} vs {along_held}; {across_sliding} vs {across_held}");
+        assert!(
+            along_sliding > 0.5 * along_held && along_sliding < 3.0 * along_held,
+            "{along_sliding} vs {along_held}; {across_sliding} vs {across_held}"
+        );
         assert!(across_sliding > 100.0 * across_held, "{across_sliding} vs {across_held}");
     }
 
