@@ -274,6 +274,8 @@ crate::dialog_descriptor::dialog_descriptors! {
                 /// direction, as `direction`.
                 force2: String,
                 direction2: usize,
+                /// Whether the second load acts on its own (1) or together with the first (0).
+                apart: usize,
                 style: usize,
                 detail: usize,
                 material: usize,
@@ -1081,6 +1083,7 @@ impl Dialog {
                     vector: String::new(),
                     force2: String::new(),
                     direction2: 5,
+                    apart: 0,
                     style: 0,
                     detail: 1,
                     material: 1,
@@ -6141,6 +6144,7 @@ fn dialog_commands(app: &SolveApp, d: &Dialog) -> Result<Vec<(String, Value)>, S
             vector,
             force2,
             direction2,
+            apart,
             style,
             detail,
             strength,
@@ -6240,13 +6244,14 @@ fn dialog_commands(app: &SolveApp, d: &Dialog) -> Result<Vec<(String, Value)>, S
                 if let Some(space) = bodies(3).into_iter().next() {
                     o.insert("space".into(), json!(space));
                 }
-                // Further faces with a force of their own, acting at the same time.
+                // Further faces with a force of their own, acting at the same time as the first
+                // or as a load case of its own.
                 let further = faces(4);
                 if !further.is_empty() {
                     // With no second force typed, they carry as much as the loaded faces.
                     let second = number(force2, "the second force in newtons")?.unwrap_or(newtons);
                     let way = GENERATIVE_DIRECTIONS.get(*direction2).map_or([0.0, 0.0, -1.0], |(_, v)| *v);
-                    o.insert("loads".into(), json!([{"faces": further, "force": way.map(|c| c * second)}]));
+                    o.insert("loads".into(), json!([{"faces": further, "force": way.map(|c| c * second), "case": 1 + (*apart).min(1)}]));
                 }
             }
             ("generative.design", params)

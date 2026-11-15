@@ -111,9 +111,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 vec![box_mesh([0.0, 0.0, 0.0], [5.0, 60.0, 80.0]), pin],
             )
         }
-        // The shelf, and a small plate beside it that is pushed sideways with half the force.
-        "two" => {
-            more.push((vec![quad([60.0, 80.0, 30.0], [80.0, 80.0, 30.0], [80.0, 80.0, 50.0], [60.0, 80.0, 50.0])], [0.0, -0.5 * newtons, 0.0]));
+        // The shelf, and a small plate beside it that is pushed sideways with half the force:
+        // at the same time (`two`) or as a load case of its own (`cases`).
+        "two" | "cases" => {
+            more.push((
+                vec![quad([60.0, 80.0, 30.0], [80.0, 80.0, 30.0], [80.0, 80.0, 50.0], [60.0, 80.0, 50.0])],
+                [0.0, -0.5 * newtons, 0.0],
+                usize::from(case == "cases"),
+            ));
             (
                 vec![quad([5.0, 0.0, 0.0], [5.0, 60.0, 0.0], [5.0, 60.0, 80.0], [5.0, 0.0, 80.0])],
                 vec![quad([30.0, 5.0, 80.0], [30.0, 55.0, 80.0], [100.0, 55.0, 80.0], [100.0, 5.0, 80.0])],

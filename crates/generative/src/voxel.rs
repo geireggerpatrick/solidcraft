@@ -523,7 +523,8 @@ struct Fem<'a> {
     dofs: Vec<[u32; 24]>,
     ndof: usize,
     fixed: Vec<bool>,
-    force: Vec<f64>,
+    /// The forces on the nodes in each load case; the first is the case of the main force.
+    forces: Vec<Vec<f64>>,
     /// The built-in solver's levels, built when it first solves.
     mg: std::sync::OnceLock<Multigrid<'a>>,
     coords: Vec<[usize; 3]>,
@@ -533,7 +534,9 @@ const NONE: u32 = u32::MAX;
 
 impl<'a> Fem<'a> {
     /// `elems`: the voxels in the model; `fixed`/`load`: voxels whose nodes are held / loaded.
-    /// `more`: further forces, each on its own voxels among the loaded ones.
+    /// `more`: further forces, each on its own voxels among the loaded ones and with its load
+    /// case: 0 acts together with `f`, forces with the same other number act together in a case
+    /// of their own.
     fn new(
         g: &'a Grid,
         brick: &'a Brick,
@@ -541,7 +544,7 @@ impl<'a> Fem<'a> {
         fixed: &[bool],
         load: &[bool],
         f: V3,
-        more: &[(Vec<bool>, V3)],
+        more: &[(Vec<bool>, V3, usize)],
         accelerate: bool,
     ) -> Fem<'a> {
         let nn = (g.n[0] + 1) * (g.n[1] + 1) * (g.n[2] + 1);
@@ -593,8 +596,13 @@ impl<'a> Fem<'a> {
         }
         // Each force is shared equally by the free nodes of its voxels; the first one acts on
         // the loaded voxels no further force names.
-        let mut force = vec![0.0; ndof];
-        let mut spread = |on: &dyn Fn(usize) -> bool, f: V3| {
+        let mut cases: Vec<usize> = more.iter().map(|m| m.2).filter(|&c| c != 0).collect();
+        cases.sort_unstable();
+        cases.dedup();
+        let mut forces = vec![vec![0.0; ndof]; 1 + cases.len()];
+        let mut spread = |case: usize, on: &dyn Fn(usize) -> bool, f: V3| {
+            let at = cases.binary_search(&case).map_or(0, |i| i + 1);
+            let Some(force) = forces.get_mut(at) else { return };
             let mut loaded = vec![false; count as usize];
             for (e, &v) in elems.iter().enumerate() {
                 if on(v) {
@@ -611,9 +619,9 @@ impl<'a> Fem<'a> {
                 }
             }
         };
-        spread(&|v| load[v] && !more.iter().any(|m| m.0.get(v) == Some(&true)), f);
-        for (on, f) in more {
-            spread(&|v| on.get(v) == Some(&true), *f);
+        spread(0, &|v| load[v] && !more.iter().any(|m| m.0.get(v) == Some(&true)), f);
+        for (on, f, case) in more {
+            spread(*case, &|v| on.get(v) == Some(&true), *f);
         }
         let coords: Vec<[usize; 3]> = elems.iter().map(|&v| g.ijk(v)).collect();
         let mut grid_node = vec![0u32; count as usize];
@@ -623,7 +631,7 @@ impl<'a> Fem<'a> {
             }
         }
         let accelerate = accelerate && grid_solver_name().is_some();
-        Fem { grid_node, accelerate, g, brick, elems, dofs, ndof, fixed: fixed_dof, force, mg: std::sync::OnceLock::new(), coords }
+        Fem { grid_node, accelerate, g, brick, elems, dofs, ndof, fixed: fixed_dof, forces, mg: std::sync::OnceLock::new(), coords }
     }
 
     fn matvec(&self, stiff: &[f64], x: &[f64], y: &mut [f64]) {
@@ -635,21 +643,22 @@ impl<'a> Fem<'a> {
         }
     }
 
-    /// Solves K u = f by CG preconditioned with a geometric multigrid V-cycle, starting from `u`.
-    /// Returns the iterations.
-    fn solve(&self, stiff: &[f64], u: &mut Vec<f64>, tol: f64, max_iter: usize) -> usize {
+    /// Solves K u = f for the forces of one load case by CG preconditioned with a geometric
+    /// multigrid V-cycle, starting from `u`. Returns the iterations.
+    fn solve(&self, case: usize, stiff: &[f64], u: &mut Vec<f64>, tol: f64, max_iter: usize) -> usize {
+        let Some(force) = self.forces.get(case) else { return 0 };
         if self.accelerate
-            && let Some(iterations) = self.solve_outside(stiff, u, tol, max_iter)
+            && let Some(iterations) = self.solve_outside(force, stiff, u, tol, max_iter)
         {
             return iterations;
         }
-        self.solve_here(stiff, u, tol, max_iter)
+        self.solve_here(force, stiff, u, tol, max_iter)
     }
 
     /// Solves with the installed [`GridSolver`], which computes in single precision: the
     /// residual is taken here in double precision and the solver finds the correction to it,
     /// until the residual is small enough. `None` when there is no solver or it failed.
-    fn solve_outside(&self, stiff: &[f64], u: &mut Vec<f64>, tol: f64, max_iter: usize) -> Option<usize> {
+    fn solve_outside(&self, force: &[f64], stiff: &[f64], u: &mut Vec<f64>, tol: f64, max_iter: usize) -> Option<usize> {
         let n = self.ndof;
         if u.len() != n {
             *u = vec![0.0; n];
@@ -664,13 +673,13 @@ impl<'a> Fem<'a> {
         for (m, &node) in self.grid_node.iter().enumerate() {
             fixed_grid[node as usize] = self.fixed[3 * m];
         }
-        let bnorm = self.force.iter().map(|v| v * v).sum::<f64>().sqrt().max(1e-300);
+        let bnorm = force.iter().map(|v| v * v).sum::<f64>().sqrt().max(1e-300);
         let mut r = vec![0.0; n];
         let mut total = 0;
         for round in 0..6 {
             self.matvec(stiff, u, &mut r);
             for i in 0..n {
-                r[i] = if self.fixed[i] { 0.0 } else { self.force[i] - r[i] };
+                r[i] = if self.fixed[i] { 0.0 } else { force[i] - r[i] };
             }
             let rnorm = r.iter().map(|v| v * v).sum::<f64>().sqrt();
             if rnorm / bnorm < tol || total >= max_iter {
@@ -715,13 +724,13 @@ impl<'a> Fem<'a> {
         self.mg.get_or_init(|| Multigrid::new(self.brick, self.g.n, &self.coords, &self.dofs, self.ndof, &self.fixed))
     }
 
-    fn solve_here(&self, stiff: &[f64], u: &mut Vec<f64>, tol: f64, max_iter: usize) -> usize {
+    fn solve_here(&self, force: &[f64], stiff: &[f64], u: &mut Vec<f64>, tol: f64, max_iter: usize) -> usize {
         let n = self.ndof;
         if u.len() != n {
             *u = vec![0.0; n];
         }
         let mg = self.levels().prepare(stiff);
-        let b: Vec<f64> = (0..n).map(|i| if self.fixed[i] { 0.0 } else { self.force[i] }).collect();
+        let b: Vec<f64> = (0..n).map(|i| if self.fixed[i] { 0.0 } else { force[i] }).collect();
         for i in 0..n {
             if self.fixed[i] {
                 u[i] = 0.0;
@@ -811,15 +820,16 @@ impl<'a> Fem<'a> {
             .collect()
     }
 
-    /// Mean displacement of the loaded nodes along the force.
-    fn load_displacement(&self, u: &[f64]) -> f64 {
-        let fnorm: f64 = self.force.iter().map(|v| v * v).sum::<f64>().sqrt();
+    /// Mean displacement of the loaded nodes along the forces of one load case.
+    fn load_displacement(&self, case: usize, u: &[f64]) -> f64 {
+        let Some(force) = self.forces.get(case) else { return 0.0 };
+        let fnorm: f64 = force.iter().map(|v| v * v).sum::<f64>().sqrt();
         if fnorm == 0.0 {
             return 0.0;
         }
-        let work: f64 = self.force.iter().zip(u).map(|(f, u)| f * u).sum();
+        let work: f64 = force.iter().zip(u).map(|(f, u)| f * u).sum();
         // force entries sum to F over the loaded nodes; work / F is the weighted displacement.
-        let total: f64 = (0..self.ndof / 3).map(|n| norm([self.force[3 * n], self.force[3 * n + 1], self.force[3 * n + 2]])).sum();
+        let total: f64 = (0..self.ndof / 3).map(|n| norm([force[3 * n], force[3 * n + 1], force[3 * n + 2]])).sum();
         work / total.max(1e-300)
     }
 }
@@ -1188,8 +1198,10 @@ pub struct Problem {
     /// Each loaded face's voxels: a design must reach every one of them.
     pub loads: Vec<Vec<usize>>,
     pub force: V3,
-    /// Further forces, each on its own voxels among the loaded ones.
-    pub more: Vec<(Vec<bool>, V3)>,
+    /// Further forces, each on its own voxels among the loaded ones and with its load case: 0
+    /// acts together with `force`, forces with the same other number act together in a case of
+    /// their own, and the structure has to carry every case.
+    pub more: Vec<(Vec<bool>, V3, usize)>,
 }
 
 #[derive(Clone, Debug)]
@@ -1284,9 +1296,21 @@ fn check_binary(p: &Problem, brick: &Brick, mask: &[bool], s: &Settings, u: &mut
     let fem = Fem::new(g, brick, elems, &p.fixed, &p.load, p.force, &p.more, s.accelerate);
     let e = s.material.modulus;
     let stiff = vec![e * g.h; fem.elems.len()];
-    u.clear();
-    fem.solve(&stiff, u, 1e-4, 120);
-    let vm = fem.von_mises(u, e);
+    // Every load case on its own: the stress and the deflection are the worst of them.
+    let mut vm = vec![0.0f64; fem.elems.len()];
+    let mut energies = vec![0.0; fem.elems.len()];
+    let mut deflection = 0.0f64;
+    for case in 0..fem.forces.len() {
+        u.clear();
+        fem.solve(case, &stiff, u, 1e-4, 120);
+        for (worst, here) in vm.iter_mut().zip(fem.von_mises(u, e)) {
+            *worst = worst.max(here);
+        }
+        for (sum, here) in energies.iter_mut().zip(fem.energies(u)) {
+            *sum += here;
+        }
+        deflection = deflection.max(fem.load_displacement(case, u));
+    }
     // Peaks right at the supports and the load are artefacts of holding whole voxels.
     let near = dilate(g, &p.fixed.iter().zip(&p.load).map(|(a, b)| *a || *b).collect::<Vec<_>>(), 1.0);
     // And the very highest values sit in single voxels at inner corners, higher the finer the
@@ -1295,10 +1319,10 @@ fn check_binary(p: &Problem, brick: &Brick, mask: &[bool], s: &Settings, u: &mut
     all.sort_by(f64::total_cmp);
     let stress = all.get((all.len() as f64 * 0.998) as usize).or(all.last()).copied().unwrap_or(0.0);
     let mut energy = vec![0.0; g.len()];
-    for (&v, en) in fem.elems.iter().zip(fem.energies(u)) {
+    for (&v, en) in fem.elems.iter().zip(energies) {
         energy[v] = en;
     }
-    Check { stress, deflection: fem.load_displacement(u), connected, energy }
+    Check { stress, deflection, connected, energy }
 }
 
 /// The parts of a design that carry next to nothing: stubs that end in the air and members the
@@ -1847,7 +1871,8 @@ fn organic_from(p: &Problem, s: &Settings, brick: &Brick, time_left: &mut dyn Fn
     if start.is_none() {
         x = vec![schedule[0]; ne];
     }
-    let mut u = Vec::new();
+    // The displacements of each load case, to start the next solve from.
+    let mut us: Vec<Vec<f64>> = vec![Vec::new(); fem.forces.len()];
     let mut ub = Vec::new();
     let mut iterations = 0;
     // One step of the optimiser towards the stiffest design of `vf` of the design space.
@@ -1859,8 +1884,14 @@ fn organic_from(p: &Problem, s: &Settings, brick: &Brick, time_left: &mut dyn Fn
         let built = overhang.as_ref().map(|o| o.printed(&hard));
         let real = built.as_ref().map_or(&hard, |b| &b.printed);
         let stiff: Vec<f64> = real.iter().map(|r| (emin + r.max(0.0).powf(pen) * (e0 - emin)) * g.h).collect();
-        fem.solve(&stiff, &mut u, 5e-3, 40);
-        let en = fem.energies(&u);
+        // The stiffest design for all load cases: the energies of the cases add up.
+        let mut en = vec![0.0; ne];
+        for (case, u) in us.iter_mut().enumerate() {
+            fem.solve(case, &stiff, u, 5e-3, 40);
+            for (sum, here) in en.iter_mut().zip(fem.energies(u)) {
+                *sum += here;
+            }
+        }
         // What the compliance gains from each voxel of the soft design, shared out over the
         // variables that make that voxel.
         let mut gain: Vec<f64> = (0..ne).map(|e| -pen * real[e].max(0.0).powf(pen - 1.0) * (e0 - emin) * g.h * en[e]).collect();
@@ -2822,6 +2853,22 @@ mod tests {
         let theory = 300.0 * 100f64.powi(3) / (3.0 * 1900.0 * i);
         // Coarse linear bricks are stiffer than theory; within a factor of two is right.
         assert!(chk.deflection > 0.4 * theory && chk.deflection < 1.2 * theory, "{} vs {theory}", chk.deflection);
+    }
+
+    #[test]
+    fn a_load_case_of_its_own_is_checked_alone() {
+        // Half of the end face pulled up as hard as the other half is pushed down: together the
+        // two only twist the bar, each alone bends it.
+        let mut p = problem(5.0);
+        let half: Vec<bool> = (0..p.grid.len()).map(|v| p.load[v] && p.grid.center(v)[1] > 20.0).collect();
+        let s = settings(Style::Organic);
+        let brick = Brick::new();
+        let mut deflection = |case: usize| {
+            p.more = vec![(half.clone(), [0.0, 0.0, 300.0], case)];
+            check_binary(&p, &brick, &p.grid.inside.clone(), &s, &mut Vec::new()).deflection
+        };
+        let (together, apart) = (deflection(0), deflection(1));
+        assert!(apart > 3.0 * together, "{apart} vs {together}");
     }
 
     fn run(style: Style, h: f64) -> Outcome {

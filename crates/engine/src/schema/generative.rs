@@ -17,7 +17,7 @@ pub struct GenerativeFace {
     pub point: Point3,
 }
 
-/// A further load: faces and the force on them.
+/// A further load: faces, the force on them and the load case it belongs to.
 #[derive(Clone, Debug, Deserialize, JsonSchema)]
 #[schemars(deny_unknown_fields)]
 pub struct GenerativeLoad {
@@ -25,6 +25,10 @@ pub struct GenerativeLoad {
     pub faces: Vec<GenerativeFace>,
     /// The force in newtons, as a vector `[x, y, z]`.
     pub force: Point3,
+    /// The load case, from 1 to 8. Loads of case 1 act at the same time as `load`; the loads of
+    /// each other case act together on their own. Default: 1.
+    #[serde(default)]
+    pub case: Option<u32>,
 }
 
 /// Grow a light structure that carries a force from the loaded faces to the held faces, as a new
@@ -41,8 +45,9 @@ pub struct GenerativeDesignParams {
     pub load: Vec<GenerativeFace>,
     /// The force in newtons, as a vector `[x, y, z]`; 9.81 N carry one kilogram.
     pub force: Point3,
-    /// Further loads that act at the same time as `load`, each with its own faces and force:
-    /// the structure carries all of them together. At most 8. Default: none.
+    /// Further loads, each with its own faces and force. Those of load case 1 act at the same
+    /// time as `load`; each other case acts on its own, and the structure carries every case.
+    /// At most 8. Default: none.
     #[serde(default)]
     pub loads: Option<Vec<GenerativeLoad>>,
     /// `organic` (default): material only where the force flows. `tree`: branches from the load

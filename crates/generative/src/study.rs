@@ -20,8 +20,10 @@ pub struct Study {
     pub load: Vec<FaceTris>,
     /// The force in newtons.
     pub force: V3,
-    /// Further loads acting at the same time: faces and the force on them, in newtons.
-    pub more: Vec<(Vec<FaceTris>, V3)>,
+    /// Further loads: faces, the force on them in newtons, and the load case. Case 0 acts at
+    /// the same time as `force`; loads with the same other number act together in a case of
+    /// their own, and the structure carries every case.
+    pub more: Vec<(Vec<FaceTris>, V3, usize)>,
     /// The body to carve the structure out of; `None`: the box around the picked faces.
     pub space: Option<Mesh>,
     /// Closed bodies the structure stays out of. With no `space`, the bodies of the picked
@@ -205,12 +207,13 @@ fn extent(study: &Study, held: &[Face], load: &[Face]) -> Result<(V3, V3, f64), 
 /// The study's problem on a grid of about `voxels` cells, for members `wall` mm thick. With
 /// `band`, a coarser level's grid and the cells around its structure, only the cells there are
 /// design space: a finer level works the structure out where the coarser one found it.
-/// `load` holds the faces of every load; `more` says which of them carry a further force.
+/// `load` holds the faces of every load; `more` says which of them carry a further force, and
+/// in which load case.
 fn level(
     study: &Study,
     held: &[Face],
     load: &[Face],
-    more: &[(std::ops::Range<usize>, V3)],
+    more: &[(std::ops::Range<usize>, V3, usize)],
     voxels: f64,
     wall: f64,
     band: Option<(&Grid, &[bool])>,
@@ -391,12 +394,12 @@ fn level(
     let keep = if boxed { both.iter().zip(&cover).map(|(a, b)| *a || *b).collect() } else { gv::dilate(&grid, &both, 1.5) };
     let more = more
         .iter()
-        .map(|(faces, force)| {
+        .map(|(faces, force, case)| {
             let mut on = vec![false; grid.len()];
             for &v in loads.get(faces.clone()).into_iter().flatten().flatten() {
                 on[v] = true;
             }
-            (on, *force)
+            (on, *force, *case)
         })
         .collect();
     Ok(Level { problem: Problem { grid, fixed, load: loaded, keep, supports, loads, force: study.force, more }, clip, within, slabs, round })
@@ -405,11 +408,11 @@ fn level(
 /// Runs the study. `time_left` is asked between steps; when it says no, the best shape so far
 /// is finished.
 pub fn run(study: &Study, time_left: &mut dyn FnMut() -> bool) -> Result<Report, String> {
-    let further = study.more.iter().flat_map(|(faces, _)| faces);
+    let further = study.more.iter().flat_map(|(faces, ..)| faces);
     if study.held.is_empty()
         || study.load.is_empty()
         || study.held.iter().chain(&study.load).chain(further).any(Vec::is_empty)
-        || study.more.iter().any(|(faces, _)| faces.is_empty())
+        || study.more.iter().any(|(faces, ..)| faces.is_empty())
     {
         return Err("give at least one held face and one loaded face".into());
     }
@@ -420,10 +423,10 @@ pub fn run(study: &Study, time_left: &mut dyn FnMut() -> bool) -> Result<Report,
     let held = faces(&study.held, boxed);
     let mut load = faces(&study.load, boxed);
     let mut more = Vec::new();
-    for (on, force) in &study.more {
+    for (on, force, case) in &study.more {
         let from = load.len();
         load.extend(faces(on, boxed));
-        more.push((from..load.len(), *force));
+        more.push((from..load.len(), *force, *case));
     }
     // An organic structure is found on a coarse grid first and worked out on finer ones, each
     // with eight times the cells but only around the structure the one before found: fine

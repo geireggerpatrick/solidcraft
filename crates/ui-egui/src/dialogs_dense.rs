@@ -983,6 +983,7 @@ fn additional_rows(app: &mut SolveApp, d: &mut Dialog, ui: &mut egui::Ui) -> boo
             vector,
             force2,
             direction2,
+            apart,
             style,
             detail,
             material,
@@ -1007,6 +1008,9 @@ fn additional_rows(app: &mut SolveApp, d: &mut Dialog, ui: &mut egui::Ui) -> boo
             enter |= hint_row_positive(ui, "Second force (N)", force2, tr("as chosen above"));
             form_row(ui, "Second direction", |ui| {
                 ui_kit::segmented(ui, direction2, &GENERATIVE_DIRECTIONS.map(|(label, _)| label), Default::default());
+            });
+            form_row(ui, "Second load acts", |ui| {
+                ui_kit::segmented(ui, apart, &["Together", "On its own"], Default::default());
             });
             form_row(ui, "Style", |ui| {
                 ui_kit::segmented(ui, style, &GENERATIVE_STYLES.map(|(label, _)| label), Default::default());

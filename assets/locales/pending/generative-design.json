@@ -62,7 +62,10 @@
     "3D print, -Z up": "طباعة ثلاثية الأبعاد، -Z للأعلى",
     "More loaded faces": "أوجه محمّلة إضافية",
     "Second force (N)": "القوة الثانية (نيوتن)",
-    "Second direction": "الاتجاه الثاني"
+    "Second direction": "الاتجاه الثاني",
+    "Second load acts": "الحمل الثاني يؤثر",
+    "Together": "معًا",
+    "On its own": "منفردًا"
   },
   "de": {
     "cmd.generative_design": "Generatives Design",
@@ -127,7 +130,10 @@
     "3D print, -Z up": "3D-Druck, -Z oben",
     "More loaded faces": "Weitere belastete Flächen",
     "Second force (N)": "Zweite Kraft (N)",
-    "Second direction": "Zweite Richtung"
+    "Second direction": "Zweite Richtung",
+    "Second load acts": "Zweite Last wirkt",
+    "Together": "Gemeinsam",
+    "On its own": "Einzeln"
   },
   "en": {
     "cmd.generative_design": "Generative Design",
@@ -192,7 +198,10 @@
     "3D print, -Z up": "3D print, -Z up",
     "More loaded faces": "More loaded faces",
     "Second force (N)": "Second force (N)",
-    "Second direction": "Second direction"
+    "Second direction": "Second direction",
+    "Second load acts": "Second load acts",
+    "Together": "Together",
+    "On its own": "On its own"
   },
   "he": {
     "cmd.generative_design": "תכנון גנרטיבי",
@@ -257,7 +266,10 @@
     "3D print, -Z up": "הדפסת תלת-ממד, -Z למעלה",
     "More loaded faces": "פאות עמוסות נוספות",
     "Second force (N)": "כוח שני (N)",
-    "Second direction": "כיוון שני"
+    "Second direction": "כיוון שני",
+    "Second load acts": "העומס השני פועל",
+    "Together": "יחד",
+    "On its own": "לבד"
   },
   "ja": {
     "cmd.generative_design": "ジェネレーティブデザイン",
@@ -322,7 +334,10 @@
     "3D print, -Z up": "3D プリント、-Z が上",
     "More loaded faces": "追加の荷重面",
     "Second force (N)": "2 つ目の力 (N)",
-    "Second direction": "2 つ目の方向"
+    "Second direction": "2 つ目の方向",
+    "Second load acts": "第2荷重の作用",
+    "Together": "同時",
+    "On its own": "単独"
   },
   "ko": {
     "cmd.generative_design": "제너레이티브 디자인",
@@ -387,7 +402,10 @@
     "3D print, -Z up": "3D 프린팅, -Z 위쪽",
     "More loaded faces": "추가 하중 면",
     "Second force (N)": "두 번째 힘 (N)",
-    "Second direction": "두 번째 방향"
+    "Second direction": "두 번째 방향",
+    "Second load acts": "두 번째 하중 작용",
+    "Together": "함께",
+    "On its own": "단독"
   },
   "vi": {
     "cmd.generative_design": "Thiết kế tạo sinh",
@@ -452,7 +470,10 @@
     "3D print, -Z up": "In 3D, -Z hướng lên",
     "More loaded faces": "Mặt chịu tải khác",
     "Second force (N)": "Lực thứ hai (N)",
-    "Second direction": "Hướng thứ hai"
+    "Second direction": "Hướng thứ hai",
+    "Second load acts": "Tải thứ hai tác dụng",
+    "Together": "Cùng lúc",
+    "On its own": "Riêng lẻ"
   },
   "zh": {
     "cmd.generative_design": "创成式设计",
@@ -517,6 +538,9 @@
     "3D print, -Z up": "3D 打印，-Z 朝上",
     "More loaded faces": "更多受力面",
     "Second force (N)": "第二个力 (N)",
-    "Second direction": "第二个方向"
+    "Second direction": "第二个方向",
+    "Second load acts": "第二载荷作用",
+    "Together": "同时",
+    "On its own": "单独"
   }
 }

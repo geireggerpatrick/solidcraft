@@ -20,7 +20,7 @@ pub static COMMANDS: &[CommandSpec] = &[
         .icon("import")
         .contract(&DESIGN_CONTRACT)
         .output(output_schema_for::<GenerativeDesignResult>)
-        .params("held: [{body, point: [x,y,z]}] (faces that are held); load: [{body, point: [x,y,z]}] (faces the force acts on); force: [x,y,z] in newtons; loads?: [{faces: [{body, point}], force: [x,y,z]}] (further loads acting at the same time); style?: organic|tree|lattice (default organic); space?: body to carve the structure out of (default: the box around the picked faces, around the bodies they belong to, which stay as they are); avoid?: [body] (further bodies to stay clear of); clearance?: mm to stay away from them; margin?: mm the design box reaches beyond the faces; strength?: MPa (default 35); modulus?: MPa (default 1900); safety?: 1…20 (default 2); voxels?: 500…2000000 cells (default 40000); wall?: thinnest strut in mm (default: two and a half cells, at least 1.5 % of the design space's longest side); deflection?: the most the loaded faces may move, in mm (default: 1/300 of the design space's longest side); goal?: lightest|stiffest; keep?: percent of the design space to fill for stiffest (default 20); symmetry?: axes to mirror in, such as x or xy; extrude?: x|y|z (one section along that axis); print?: +x|-x|+y|-y|+z|-z (stands without supports when printed that way up); time?: seconds the computation may take (default 900); name?; body_name? (default Generative): a new mesh body that carries the force from the loaded to the held faces with as little material as the strength allows"),
+        .params("held: [{body, point: [x,y,z]}] (faces that are held); load: [{body, point: [x,y,z]}] (faces the force acts on); force: [x,y,z] in newtons; loads?: [{faces: [{body, point}], force: [x,y,z], case?: 1…8}] (further loads; those of case 1, the default, act at the same time as `load`, each other case acts on its own and the structure carries every case); style?: organic|tree|lattice (default organic); space?: body to carve the structure out of (default: the box around the picked faces, around the bodies they belong to, which stay as they are); avoid?: [body] (further bodies to stay clear of); clearance?: mm to stay away from them; margin?: mm the design box reaches beyond the faces; strength?: MPa (default 35); modulus?: MPa (default 1900); safety?: 1…20 (default 2); voxels?: 500…2000000 cells (default 40000); wall?: thinnest strut in mm (default: two and a half cells, at least 1.5 % of the design space's longest side); deflection?: the most the loaded faces may move, in mm (default: 1/300 of the design space's longest side); goal?: lightest|stiffest; keep?: percent of the design space to fill for stiffest (default 20); symmetry?: axes to mirror in, such as x or xy; extrude?: x|y|z (one section along that axis); print?: +x|-x|+y|-y|+z|-z (stands without supports when printed that way up); time?: seconds the computation may take (default 900); name?; body_name? (default Generative): a new mesh body that carries the force from the loaded to the held faces with as little material as the strength allows"),
 ];
 
 fn v3(p: Vec3) -> V3 {
@@ -130,6 +130,9 @@ fn design(s: &mut Session, p: &Value) -> Result<Value> {
     if further.iter().any(|l| !(newtons(v3(l.force.0)) > 1e-6 && newtons(v3(l.force.0)) < 1e7)) {
         return Err(bad(CMD, "`loads`: each `force` must be a vector in newtons, not zero"));
     }
+    if further.iter().any(|l| l.case.is_some_and(|c| !(1..=8).contains(&c))) {
+        return Err(bad(CMD, "`loads`: each `case` must be a number from 1 to 8"));
+    }
     let style = match q.style.as_deref().unwrap_or(gv::STYLE_ORGANIC) {
         gv::STYLE_ORGANIC => Style::Organic,
         gv::STYLE_TREE => Style::Tree,
@@ -177,9 +180,11 @@ fn design(s: &mut Session, p: &Value) -> Result<Value> {
     let st = s.model.state();
     let held: Vec<Picked> = q.held.iter().map(|f| pick(s, &st, f, "held")).collect::<Result<_>>()?;
     let load: Vec<Picked> = q.load.iter().map(|f| pick(s, &st, f, "load")).collect::<Result<_>>()?;
-    let mut more: Vec<(Vec<Picked>, V3)> = Vec::new();
+    // The load's case counted from 0, the case of `load`.
+    let mut more: Vec<(Vec<Picked>, V3, usize)> = Vec::new();
     for l in further {
-        more.push((l.faces.iter().map(|f| pick(s, &st, f, "loads")).collect::<Result<_>>()?, v3(l.force.0)));
+        let case = l.case.map_or(0, |c| c.saturating_sub(1) as usize);
+        more.push((l.faces.iter().map(|f| pick(s, &st, f, "loads")).collect::<Result<_>>()?, v3(l.force.0), case));
     }
     let space = match q.space.as_deref().filter(|n| !n.trim().is_empty()) {
         Some(n) => Some(s.own_body_name(n).ok_or_else(|| bad(CMD, format!("`space`: no body `{n}`")))?),
@@ -210,7 +215,7 @@ fn design(s: &mut Session, p: &Value) -> Result<Value> {
         held: held.into_iter().map(|f| f.tris).collect(),
         load: load.into_iter().map(|f| f.tris).collect(),
         force,
-        more: more.into_iter().map(|(faces, force)| (faces.into_iter().map(|f| f.tris).collect(), force)).collect(),
+        more: more.into_iter().map(|(faces, force, case)| (faces.into_iter().map(|f| f.tris).collect(), force, case)).collect(),
         space,
         obstacles: obstacles.iter().filter_map(|n| body_mesh(&st, n)).collect(),
         avoid: avoid.iter().filter_map(|n| body_mesh(&st, n)).collect(),
@@ -316,20 +321,23 @@ mod tests {
         assert!(body.body.triangle_corner_normals().is_some_and(|n| !n.is_empty()));
     }
 
-    /// A second force on a face of a third body: the structure reaches that body too.
+    /// A second force on a face of a third body: the structure reaches that body too, whether
+    /// the force acts together with the first (case 1) or as a load case of its own.
     #[test]
     fn a_further_load_is_carried_too() {
-        let mut s = wall_and_shelf();
-        let rail = json!({"length": 40, "width": 4, "height": 10, "corner": [20, 36, 20], "operation": "new", "body_name": "Rail"});
-        s.execute("solid.box", &rail).unwrap();
-        let loads = json!([{"faces": [{"body": "Rail", "point": [40, 36, 25]}], "force": [0, 30, 0]}]);
-        let reply = s.execute("generative.design", &design(json!({"loads": loads, "voxels": 6000}))).unwrap();
-        assert!(reply["design"]["cells"].as_u64().is_some(), "{reply}");
-        let st = s.model.state();
-        let body = st.bodies.iter().find(|b| b.name == "Generative").expect("the new body");
-        let mesh = body.mesh();
-        let near_rail = mesh.triangles.iter().filter_map(|t| mesh.tri(t)).flatten().any(|p| p.y > 34.0 && p.z > 19.0 && p.z < 31.0);
-        assert!(body.body.is_closed_mesh() && near_rail);
+        for case in [1, 2] {
+            let mut s = wall_and_shelf();
+            let rail = json!({"length": 40, "width": 4, "height": 10, "corner": [20, 36, 20], "operation": "new", "body_name": "Rail"});
+            s.execute("solid.box", &rail).unwrap();
+            let loads = json!([{"faces": [{"body": "Rail", "point": [40, 36, 25]}], "force": [0, 30, 0], "case": case}]);
+            let reply = s.execute("generative.design", &design(json!({"loads": loads, "voxels": 6000}))).unwrap();
+            assert!(reply["design"]["cells"].as_u64().is_some(), "{reply}");
+            let st = s.model.state();
+            let body = st.bodies.iter().find(|b| b.name == "Generative").expect("the new body");
+            let mesh = body.mesh();
+            let near_rail = mesh.triangles.iter().filter_map(|t| mesh.tri(t)).flatten().any(|p| p.y > 34.0 && p.z > 19.0 && p.z < 31.0);
+            assert!(body.body.is_closed_mesh() && near_rail, "case {case}");
+        }
     }
 
     /// Normals that waver from corner to corner of a flat stretch come out alike, and the two
@@ -360,6 +368,7 @@ mod tests {
             json!({"clearance": -1}),
             json!({"time": 1}),
             json!({"loads": [{"faces": [], "force": [0, 0, 1]}]}),
+            json!({"loads": [{"faces": [{"body": "Shelf", "point": [40, 20, 50]}], "force": [0, 0, 1], "case": 9}]}),
             json!({"loads": [{"faces": [{"body": "Shelf", "point": [40, 20, 50]}], "force": [0, 0, 0]}]}),
         ] {
             assert!(s.execute("generative.design", &design(extra.clone())).is_err(), "{extra}");

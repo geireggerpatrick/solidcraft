@@ -466,7 +466,7 @@ fn control_role(command: &str, label: &str) -> Option<egui::accesskit::Role> {
     Some(match label {
         "Type" if matches!(command, "sheet.flange" | "sheet.hem" | "solid.revolve" | "solid.emboss" | "solid.scale") => return None,
         "Direction" | "Second direction" => return None, // segmented buttons, labelled by each choice
-        "Style" | "Detail" | "Goal" if command == "generative.design" => return None,
+        "Style" | "Detail" | "Goal" | "Second load acts" if command == "generative.design" => return None,
         "Material" | "Mirror" | "Manufacturing" if command == "generative.design" => Role::ComboBox,
         "ui.fair_strength" | "ui.fair_iterations" => return None,
         "Size" if matches!(command, "solid.cylinder" | "solid.sphere") => return None, // Diameter | Radius
@@ -652,6 +652,7 @@ form_case!(
         "Direction (x, y, z)",
         "Second force (N)",
         "Second direction",
+        "Second load acts",
         "Style",
         "Detail",
         "Material",
