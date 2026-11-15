@@ -465,9 +465,9 @@ fn control_role(command: &str, label: &str) -> Option<egui::accesskit::Role> {
     use egui::accesskit::Role;
     Some(match label {
         "Type" if matches!(command, "sheet.flange" | "sheet.hem" | "solid.revolve" | "solid.emboss" | "solid.scale") => return None,
-        "Direction" => return None, // segmented buttons, labelled by each choice
-        "Style" | "Detail" if command == "generative.design" => return None,
-        "Material" if command == "generative.design" => Role::ComboBox,
+        "Direction" | "Second direction" => return None, // segmented buttons, labelled by each choice
+        "Style" | "Detail" | "Goal" if command == "generative.design" => return None,
+        "Material" | "Mirror" | "Manufacturing" if command == "generative.design" => Role::ComboBox,
         "ui.fair_strength" | "ui.fair_iterations" => return None,
         "Size" if matches!(command, "solid.cylinder" | "solid.sphere") => return None, // Diameter | Radius
         "Continuity" | "Corners" | "Cells" | "Profile" => return None,
@@ -650,6 +650,8 @@ form_case!(
         "Force (N)",
         "Direction",
         "Direction (x, y, z)",
+        "Second force (N)",
+        "Second direction",
         "Style",
         "Detail",
         "Material",
@@ -658,7 +660,12 @@ form_case!(
         "Safety factor",
         "Thinnest member (mm)",
         "Largest deflection (mm)",
-        "Room around (mm)"
+        "Room around (mm)",
+        "Goal",
+        "Mirror",
+        "Manufacturing",
+        "Clearance (mm)",
+        "Time limit (min)"
     ]
 );
 form_case!(axis_two_planes, "construct.axis.two_planes", []);

@@ -1,5 +1,5 @@
 //! Runs a small study and writes the structure as an STL file, to look at a change quickly:
-//! `cargo run --release -p solidcraft-generative-gpu --example study -- shelf out.stl [voxels] [style] [newtons] [wall] [cpu|gpu|any] [deflection]`.
+//! `cargo run --release -p solidcraft-generative-gpu --example study -- shelf out.stl [voxels] [style] [newtons] [wall] [cpu|gpu|any] [deflection] [mirror: xyz|-] [extrude: x|y|z|-] [keep: 0..1]`.
 //! `gpu` (the default) computes on a hardware adapter when there is one, `any` also on a software
 //! adapter, `cpu` never on an adapter.
 
@@ -56,6 +56,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let deflection: f64 = args.get(8).and_then(|v| v.parse().ok()).unwrap_or(0.0);
     let mut force = [0.0, 0.0, -newtons];
+    let mut more = Vec::new();
     let (held, load, obstacles): (Vec<Vec<[V3; 3]>>, Vec<Vec<[V3; 3]>>, Vec<Mesh>) = match case {
         // A plate held above five feet spread out below it, each pushed upwards.
         "bracket" => {
@@ -81,6 +82,48 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             vec![quad([200.0, 250.0, -10.0], [200.0, 250.0, 30.0], [200.0, 330.0, 30.0], [200.0, 330.0, -10.0])],
             vec![box_mesh([0.0, 0.0, 0.0], [20.0, 400.0, 40.0]), box_mesh([200.0, 250.0, -10.0], [210.0, 330.0, 30.0])],
         ),
+        // A wall plate and a round pin in front of it, loaded on its round face.
+        "pin" => {
+            let ring = |y: f64| -> Vec<V3> {
+                (0..32).map(|i| std::f64::consts::TAU * f64::from(i) / 32.0).map(|t| [70.0 + 6.0 * t.cos(), y, 50.0 + 6.0 * t.sin()]).collect()
+            };
+            let (a, b) = (ring(10.0), ring(50.0));
+            let mut side = Vec::new();
+            let mut pin = Mesh::default();
+            for i in 0..32 {
+                let j = (i + 1) % 32;
+                side.extend(quad(a[j], a[i], b[i], b[j]));
+                // The ends close the pin: fans around the middles of the two rings.
+                side.iter().rev().take(2).for_each(|t| {
+                    let at = pin.pos.len();
+                    pin.pos.extend(*t);
+                    pin.tri.push([at, at + 1, at + 2]);
+                });
+                for (middle, p, q) in [([70.0, 10.0, 50.0], a[i], a[j]), ([70.0, 50.0, 50.0], b[j], b[i])] {
+                    let at = pin.pos.len();
+                    pin.pos.extend([middle, p, q]);
+                    pin.tri.push([at, at + 1, at + 2]);
+                }
+            }
+            (
+                vec![quad([5.0, 0.0, 0.0], [5.0, 60.0, 0.0], [5.0, 60.0, 80.0], [5.0, 0.0, 80.0])],
+                vec![side],
+                vec![box_mesh([0.0, 0.0, 0.0], [5.0, 60.0, 80.0]), pin],
+            )
+        }
+        // The shelf, and a small plate beside it that is pushed sideways with half the force.
+        "two" => {
+            more.push((vec![quad([60.0, 80.0, 30.0], [80.0, 80.0, 30.0], [80.0, 80.0, 50.0], [60.0, 80.0, 50.0])], [0.0, -0.5 * newtons, 0.0]));
+            (
+                vec![quad([5.0, 0.0, 0.0], [5.0, 60.0, 0.0], [5.0, 60.0, 80.0], [5.0, 0.0, 80.0])],
+                vec![quad([30.0, 5.0, 80.0], [30.0, 55.0, 80.0], [100.0, 55.0, 80.0], [100.0, 5.0, 80.0])],
+                vec![
+                    box_mesh([0.0, 0.0, 0.0], [5.0, 60.0, 80.0]),
+                    box_mesh([30.0, 5.0, 80.0], [100.0, 55.0, 85.0]),
+                    box_mesh([60.0, 80.0, 30.0], [80.0, 85.0, 50.0]),
+                ],
+            )
+        }
         // A wall plate and a shelf plate in front of it.
         _ => (
             vec![quad([5.0, 0.0, 0.0], [5.0, 60.0, 0.0], [5.0, 60.0, 80.0], [5.0, 0.0, 80.0])],
@@ -92,18 +135,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         held,
         load,
         force,
+        more,
         space: None,
         obstacles,
+        avoid: Vec::new(),
+        clearance: 0.0,
         margin: 0.0,
         voxels,
         settings: Settings {
             style,
             material: Material { strength: 35.0, modulus: 1900.0, density: 1.27 },
             safety: 2.0,
-            volume: None,
+            volume: args.get(11).and_then(|v| v.parse().ok()),
             min_wall: wall,
             max_deflection: deflection,
             accelerate: true,
+            symmetry: (*b"xyz").map(|axis| args.get(9).is_some_and(|a| a.bytes().any(|c| c == axis))),
+            extrude: args.get(10).and_then(|a| ["x", "y", "z"].iter().position(|x| x == a)),
+            print: args.get(12).and_then(|a| Some((["x", "y", "z"].iter().position(|x| a.ends_with(x))?, !a.starts_with('-')))),
         },
     };
     let t = std::time::Instant::now();

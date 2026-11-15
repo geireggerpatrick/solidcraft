@@ -189,6 +189,24 @@ impl Grid {
         }
         false
     }
+    /// Whether a face neighbour of the voxel is not in `set` (or the voxel is at the grid's edge).
+    pub fn on_surface_of(&self, id: usize, set: impl Fn(usize) -> bool) -> bool {
+        let p = self.ijk(id);
+        for a in 0..3 {
+            for s in [-1i64, 1] {
+                let v = p[a] as i64 + s;
+                if v < 0 || v >= self.n[a] as i64 {
+                    return true;
+                }
+                let mut q = p;
+                q[a] = v as usize;
+                if !set(self.id(q[0], q[1], q[2])) {
+                    return true;
+                }
+            }
+        }
+        false
+    }
     /// The voxel a point lies in.
     pub fn at(&self, p: V3) -> Option<usize> {
         let c = [0, 1, 2].map(|a| ((p[a] - self.origin[a]) / self.h).floor());
@@ -515,7 +533,17 @@ const NONE: u32 = u32::MAX;
 
 impl<'a> Fem<'a> {
     /// `elems`: the voxels in the model; `fixed`/`load`: voxels whose nodes are held / loaded.
-    fn new(g: &'a Grid, brick: &'a Brick, elems: Vec<usize>, fixed: &[bool], load: &[bool], f: V3, accelerate: bool) -> Fem<'a> {
+    /// `more`: further forces, each on its own voxels among the loaded ones.
+    fn new(
+        g: &'a Grid,
+        brick: &'a Brick,
+        elems: Vec<usize>,
+        fixed: &[bool],
+        load: &[bool],
+        f: V3,
+        more: &[(Vec<bool>, V3)],
+        accelerate: bool,
+    ) -> Fem<'a> {
         let nn = (g.n[0] + 1) * (g.n[1] + 1) * (g.n[2] + 1);
         let node = |i: usize, j: usize, k: usize| i + (g.n[0] + 1) * (j + (g.n[1] + 1) * k);
         let corners = |v: usize| -> [usize; 8] {
@@ -556,28 +584,36 @@ impl<'a> Fem<'a> {
             })
             .collect();
         let mut fixed_dof = vec![false; ndof];
-        let mut loaded = vec![false; count as usize];
         for (e, &v) in elems.iter().enumerate() {
             if fixed[v] {
                 for d in dofs[e] {
                     fixed_dof[d as usize] = true;
                 }
             }
-            if load[v] {
-                for a in 0..8 {
-                    loaded[(dofs[e][3 * a] / 3) as usize] = true;
-                }
-            }
         }
-        let free_loaded: Vec<usize> = (0..count as usize).filter(|&n| loaded[n] && !fixed_dof[3 * n]).collect();
+        // Each force is shared equally by the free nodes of its voxels; the first one acts on
+        // the loaded voxels no further force names.
         let mut force = vec![0.0; ndof];
-        if !free_loaded.is_empty() {
-            let share = 1.0 / free_loaded.len() as f64;
-            for n in free_loaded {
-                for x in 0..3 {
-                    force[3 * n + x] = f[x] * share;
+        let mut spread = |on: &dyn Fn(usize) -> bool, f: V3| {
+            let mut loaded = vec![false; count as usize];
+            for (e, &v) in elems.iter().enumerate() {
+                if on(v) {
+                    for a in 0..8 {
+                        loaded[(dofs[e][3 * a] / 3) as usize] = true;
+                    }
                 }
             }
+            let free: Vec<usize> = (0..count as usize).filter(|&n| loaded[n] && !fixed_dof[3 * n]).collect();
+            let share = 1.0 / free.len().max(1) as f64;
+            for n in free {
+                for x in 0..3 {
+                    force[3 * n + x] += f[x] * share;
+                }
+            }
+        };
+        spread(&|v| load[v] && !more.iter().any(|m| m.0.get(v) == Some(&true)), f);
+        for (on, f) in more {
+            spread(&|v| on.get(v) == Some(&true), *f);
         }
         let coords: Vec<[usize; 3]> = elems.iter().map(|&v| g.ijk(v)).collect();
         let mut grid_node = vec![0u32; count as usize];
@@ -1152,6 +1188,8 @@ pub struct Problem {
     /// Each loaded face's voxels: a design must reach every one of them.
     pub loads: Vec<Vec<usize>>,
     pub force: V3,
+    /// Further forces, each on its own voxels among the loaded ones.
+    pub more: Vec<(Vec<bool>, V3)>,
 }
 
 #[derive(Clone, Debug)]
@@ -1166,6 +1204,16 @@ pub struct Settings {
     pub max_deflection: f64,
     /// Compute with the installed [`GridSolver`] (a GPU) when there is one.
     pub accelerate: bool,
+    /// The structure is its own mirror image in the planes through the middle of the design
+    /// space that are normal to X, Y and Z.
+    pub symmetry: [bool; 3],
+    /// The axis along which the structure has the same section everywhere, as if cut out of a
+    /// plate; `None` for a free shape. Organic style only, like `symmetry`.
+    pub extrude: Option<usize>,
+    /// The structure is printed layer by layer along this axis, upwards (`true`) or downwards,
+    /// and has to stand without supports: no part of it overhangs by more than 45 degrees.
+    /// Organic style only.
+    pub print: Option<(usize, bool)>,
 }
 
 #[derive(Clone, Debug)]
@@ -1233,7 +1281,7 @@ fn check_binary(p: &Problem, brick: &Brick, mask: &[bool], s: &Settings, u: &mut
         return Check { stress: f64::INFINITY, deflection: f64::INFINITY, connected: false, energy: Vec::new() };
     }
     let elems: Vec<usize> = (0..g.len()).filter(|&v| part[v]).collect();
-    let fem = Fem::new(g, brick, elems, &p.fixed, &p.load, p.force, s.accelerate);
+    let fem = Fem::new(g, brick, elems, &p.fixed, &p.load, p.force, &p.more, s.accelerate);
     let e = s.material.modulus;
     let stiff = vec![e * g.h; fem.elems.len()];
     u.clear();
@@ -1241,7 +1289,11 @@ fn check_binary(p: &Problem, brick: &Brick, mask: &[bool], s: &Settings, u: &mut
     let vm = fem.von_mises(u, e);
     // Peaks right at the supports and the load are artefacts of holding whole voxels.
     let near = dilate(g, &p.fixed.iter().zip(&p.load).map(|(a, b)| *a || *b).collect::<Vec<_>>(), 1.0);
-    let stress = fem.elems.iter().zip(&vm).filter(|(v, _)| !near[**v]).map(|(_, s)| *s).fold(0.0, f64::max);
+    // And the very highest values sit in single voxels at inner corners, higher the finer the
+    // grid: the stress is what all but one voxel in 500 stay under.
+    let mut all: Vec<f64> = fem.elems.iter().zip(&vm).filter(|(v, _)| !near[**v]).map(|(_, s)| *s).collect();
+    all.sort_by(f64::total_cmp);
+    let stress = all.get((all.len() as f64 * 0.998) as usize).or(all.last()).copied().unwrap_or(0.0);
     let mut energy = vec![0.0; g.len()];
     for (&v, en) in fem.elems.iter().zip(fem.energies(u)) {
         energy[v] = en;
@@ -1502,6 +1554,127 @@ pub fn refine(p: &Problem, s: &Settings, start: &[f64], time_left: &mut dyn FnMu
     organic_from(p, s, &Brick::new(), time_left, Some(start))
 }
 
+/// What a printer can build without supports: a voxel is only as solid as the most solid of the
+/// five voxels under it, the one straight below and its four neighbours, which allows overhangs
+/// of 45 degrees. Voxels that always stay (they stand for bodies that exist) and the lowest
+/// layer of the design space are solid on their own. Smooth versions of "least" and "most" are
+/// used, so the optimiser can tell what a change does (after M. Langelaar's filter for additive
+/// manufacturing).
+struct Overhang {
+    /// The elements layer by layer, from the lowest up.
+    layers: Vec<Vec<u32>>,
+    /// The five elements under each, `NONE` where there is none.
+    under: Vec<[u32; 5]>,
+    base: Vec<bool>,
+}
+
+/// What [`Overhang::printed`] keeps for [`Overhang::back`].
+struct Printed {
+    printed: Vec<f64>,
+    sum: Vec<f64>,
+    support: Vec<f64>,
+    root: Vec<f64>,
+}
+
+impl Overhang {
+    const P: f64 = 40.0;
+    const EPS: f64 = 1e-4;
+
+    fn new(g: &Grid, elems: &[usize], local: &[u32], keep: &[bool], axis: usize, up: bool) -> Overhang {
+        let axis = axis.min(2);
+        let n = g.n.map(|c| c as i64);
+        let layer_of = |c: [usize; 3]| if up { c[axis] } else { g.n[axis] - 1 - c[axis] };
+        let lowest = elems.iter().map(|&v| layer_of(g.ijk(v))).min().unwrap_or(0);
+        let mut layers: Vec<Vec<u32>> = vec![Vec::new(); g.n[axis]];
+        let mut under = vec![[NONE; 5]; elems.len()];
+        let mut base = vec![false; elems.len()];
+        let (b, c) = ((axis + 1) % 3, (axis + 2) % 3);
+        for (e, &v) in elems.iter().enumerate() {
+            let cell = g.ijk(v);
+            let layer = layer_of(cell);
+            layers[layer].push(e as u32);
+            base[e] = keep[e] || layer == lowest;
+            let mut below = cell.map(|x| x as i64);
+            below[axis] += if up { -1 } else { 1 };
+            for (slot, (db, dc)) in [(0, 0), (-1, 0), (1, 0), (0, -1), (0, 1)].into_iter().enumerate() {
+                let mut q = below;
+                q[b] += db;
+                q[c] += dc;
+                if (0..3).all(|a| q[a] >= 0 && q[a] < n[a]) {
+                    under[e][slot] = local[g.id(q[0] as usize, q[1] as usize, q[2] as usize)];
+                }
+            }
+        }
+        Overhang { layers, under, base }
+    }
+
+    fn constants() -> (f64, f64, f64) {
+        let q = Self::P + 5f64.ln() / 0.5f64.ln();
+        let shift = 100.0 * f64::MIN_POSITIVE.powf(1.0 / Self::P);
+        (q, shift, 0.95 * 5f64.powf(1.0 / q) * shift.powf(Self::P / q))
+    }
+
+    /// The printed design from the design `x`.
+    fn printed(&self, x: &[f64]) -> Printed {
+        let (q, shift, back) = Self::constants();
+        let mut out = Printed { printed: x.to_vec(), sum: vec![0.0; x.len()], support: vec![0.0; x.len()], root: vec![1.0; x.len()] };
+        for layer in &self.layers {
+            for &e in layer {
+                let e = e as usize;
+                if self.base[e] {
+                    continue;
+                }
+                let sum: f64 = self.under[e].iter().map(|&u| (if u == NONE { 0.0 } else { out.printed[u as usize] } + shift).powf(Self::P)).sum();
+                let support = sum.powf(1.0 / q) - back;
+                let root = ((x[e] - support) * (x[e] - support) + Self::EPS).sqrt();
+                out.printed[e] = 0.5 * ((x[e] + support) - root + Self::EPS.sqrt());
+                out.sum[e] = sum;
+                out.support[e] = support;
+                out.root[e] = root;
+            }
+        }
+        out
+    }
+
+    /// What a change of the design `x` does, from what a change of the printed design does.
+    fn back(&self, x: &[f64], state: &Printed, of_printed: &[f64]) -> Vec<f64> {
+        let (q, shift, _) = Self::constants();
+        let mut carried = vec![0.0; x.len()];
+        let mut out = vec![0.0; x.len()];
+        for layer in self.layers.iter().rev() {
+            for &e in layer {
+                let e = e as usize;
+                let total = of_printed[e] + carried[e];
+                if self.base[e] {
+                    out[e] = total;
+                    continue;
+                }
+                let by_x = 0.5 * (1.0 - (x[e] - state.support[e]) / state.root[e]);
+                out[e] = by_x * total;
+                let by_support = (1.0 - by_x) * total * (Self::P / q) * state.sum[e].powf(1.0 / q - 1.0);
+                for &u in &self.under[e] {
+                    if u != NONE {
+                        carried[u as usize] += by_support * (state.printed[u as usize] + shift).powf(Self::P - 1.0);
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// Takes out of a 0/1 design, one flag per element, what nothing under it holds up.
+    fn trim(&self, solid: &mut [bool]) {
+        for layer in &self.layers {
+            for &e in layer {
+                let e = e as usize;
+                if solid[e] && !self.base[e] && !self.under[e].iter().any(|&u| u != NONE && solid[u as usize]) {
+                    solid[e] = false;
+                }
+            }
+        }
+    }
+}
+
 fn organic(p: &Problem, s: &Settings, brick: &Brick, time_left: &mut dyn FnMut() -> bool) -> Result<Outcome, String> {
     organic_from(p, s, brick, time_left, None)
 }
@@ -1510,7 +1683,7 @@ fn organic_from(p: &Problem, s: &Settings, brick: &Brick, time_left: &mut dyn Fn
     let g = &p.grid;
     let elems: Vec<usize> = (0..g.len()).filter(|&v| g.inside[v]).collect();
     let ne = elems.len();
-    let fem = Fem::new(g, brick, elems.clone(), &p.fixed, &p.load, p.force, s.accelerate);
+    let fem = Fem::new(g, brick, elems.clone(), &p.fixed, &p.load, p.force, &p.more, s.accelerate);
     let e0 = s.material.modulus;
     let emin = e0 * 1e-4;
     let pen = 3.0;
@@ -1584,6 +1757,7 @@ fn organic_from(p: &Problem, s: &Settings, brick: &Brick, time_left: &mut dyn Fn
         }
         done.into_iter().flatten().collect()
     };
+    let overhang = s.print.map(|(axis, up)| Overhang::new(g, &elems, &local, &keep, axis, up));
     let ones = vec![1.0; ne];
     let weight = each(&|e| around(e, &ones).max(1e-300));
     let soften = |x: &[f64]| -> Vec<f64> { each(&|e| if keep[e] { 1.0 } else { around(e, x) / weight[e] }) };
@@ -1601,13 +1775,68 @@ fn organic_from(p: &Problem, s: &Settings, brick: &Brick, time_left: &mut dyn Fn
     // always stay.
     let kept = keep.iter().filter(|k| **k).count() as f64;
     let free = (ne as f64 - kept).max(1.0);
+    // Voxels that have to be alike, mirror images of each other or in one line along the axis
+    // of an extruded shape, are groups: after every step each takes its group's average.
+    let mut group: Vec<u32> = (0..ne as u32).collect();
+    fn find(group: &mut [u32], mut e: u32) -> u32 {
+        while group[e as usize] != e {
+            group[e as usize] = group[group[e as usize] as usize];
+            e = group[e as usize];
+        }
+        e
+    }
+    let mut tied = false;
+    for e in 0..ne {
+        let c = cells[e];
+        let mut partners: Vec<[i64; 3]> = Vec::new();
+        for axis in 0..3 {
+            if s.symmetry[axis] {
+                let mut q = c;
+                q[axis] = n[axis] - 1 - c[axis];
+                partners.push(q);
+            }
+        }
+        if let Some(axis) = s.extrude.filter(|a| *a < 3 && c[*a] > 0) {
+            let mut q = c;
+            q[axis] -= 1;
+            partners.push(q);
+        }
+        for q in partners {
+            let f = local[g.id(q[0] as usize, q[1] as usize, q[2] as usize)];
+            if f != u32::MAX && !keep[e] && !keep[f as usize] {
+                let (a, b) = (find(&mut group, e as u32), find(&mut group, f));
+                if a != b {
+                    group[a as usize] = b;
+                    tied = true;
+                }
+            }
+        }
+    }
+    let roots: Vec<u32> = if tied { (0..ne as u32).map(|e| find(&mut group, e)).collect() } else { Vec::new() };
+    let tie = |x: &mut [f64]| {
+        if roots.is_empty() {
+            return;
+        }
+        let mut sum = vec![0.0; ne];
+        let mut count = vec![0u32; ne];
+        for e in 0..ne {
+            sum[roots[e] as usize] += x[e];
+            count[roots[e] as usize] += 1;
+        }
+        for e in 0..ne {
+            let r = roots[e] as usize;
+            if count[r] > 1 {
+                x[e] = sum[r] / count[r] as f64;
+            }
+        }
+    };
     // The variables to begin with: half full, or the design a coarser grid found.
     let mut x: Vec<f64> = match start {
         Some(start) => elems.iter().map(|&v| start[v].clamp(1e-3, 1.0)).collect(),
         None => Vec::new(),
     };
     let schedule: Vec<f64> = match (s.volume, start) {
-        (Some(v), _) => vec![v.clamp(0.05, 1.0)],
+        (Some(v), _) => vec![v.clamp(0.01, 1.0)],
         (None, None) => vec![0.5, 0.4, 0.32, 0.26, 0.21, 0.17, 0.14, 0.11, 0.09, 0.075, 0.062, 0.051, 0.042, 0.035, 0.029, 0.024, 0.02],
         // From the material the coarser design has, 15 % less each step.
         (None, Some(_)) => {
@@ -1626,12 +1855,21 @@ fn organic_from(p: &Problem, s: &Settings, brick: &Brick, time_left: &mut dyn Fn
         iterations += 1;
         let soft = soften(x);
         let hard: Vec<f64> = soft.iter().map(|&r| harden(beta, r)).collect();
-        let stiff: Vec<f64> = hard.iter().map(|r| (emin + r.powf(pen) * (e0 - emin)) * g.h).collect();
+        // Printed without supports, only what something holds up is there.
+        let built = overhang.as_ref().map(|o| o.printed(&hard));
+        let real = built.as_ref().map_or(&hard, |b| &b.printed);
+        let stiff: Vec<f64> = real.iter().map(|r| (emin + r.max(0.0).powf(pen) * (e0 - emin)) * g.h).collect();
         fem.solve(&stiff, &mut u, 5e-3, 40);
         let en = fem.energies(&u);
         // What the compliance gains from each voxel of the soft design, shared out over the
         // variables that make that voxel.
-        let gain: Vec<f64> = (0..ne).map(|e| -pen * hard[e].powf(pen - 1.0) * (e0 - emin) * g.h * en[e] * slope(beta, soft[e]) / weight[e]).collect();
+        let mut gain: Vec<f64> = (0..ne).map(|e| -pen * real[e].max(0.0).powf(pen - 1.0) * (e0 - emin) * g.h * en[e]).collect();
+        if let (Some(o), Some(b)) = (&overhang, &built) {
+            gain = o.back(&hard, b, &gain);
+        }
+        for e in 0..ne {
+            gain[e] *= slope(beta, soft[e]) / weight[e];
+        }
         let dc = each(&|e| around(e, &gain));
         // Optimality criteria update.
         let target = kept + vf * free;
@@ -1656,6 +1894,7 @@ fn organic_from(p: &Problem, s: &Settings, brick: &Brick, time_left: &mut dyn Fn
                 break;
             }
         }
+        tie(&mut xn);
         *x = xn;
     };
     // The 0/1 design `x` stands for, checked for stress and deflection. A design that is still
@@ -1682,7 +1921,14 @@ fn organic_from(p: &Problem, s: &Settings, brick: &Brick, time_left: &mut dyn Fn
             mask[v] = soft[e] > level || keep[e];
             rho[v] = (soft[e] - level + 0.5).clamp(0.0, 1.0);
         }
-        let mask = thick(g, &mask, &rho, &p.keep, crisp.then_some(&p.fixed[..]));
+        let mut mask = thick(g, &mask, &rho, &p.keep, crisp.then_some(&p.fixed[..]));
+        if let Some(o) = &overhang {
+            let mut solid: Vec<bool> = elems.iter().map(|&v| mask[v]).collect();
+            o.trim(&mut solid);
+            for (e, &v) in elems.iter().enumerate() {
+                mask[v] = solid[e];
+            }
+        }
         let chk = check_binary(p, brick, &mask, s, &mut ub);
         let ok = chk.connected && chk.stress <= allowed && (!(s.max_deflection > 0.0) || chk.deflection <= s.max_deflection);
         (connected_part(g, &mask, &p.fixed), rho, chk, ok)
@@ -2001,8 +2247,9 @@ fn lattice(p: &Problem, s: &Settings, brick: &Brick, time_left: &mut dyn FnMut()
     let dep = depth(g);
     let allowed = allowed_stress(s);
     let mut u = Vec::new();
-    // From lightest to heaviest: (skin voxels, cell size in voxels).
-    let options = [(1.0, 6), (1.0, 5), (1.0, 4), (2.0, 5), (2.0, 4), (2.0, 3), (3.0, 3)];
+    // From lightest to heaviest: (skin voxels, cell size in voxels). The struts are two voxels
+    // thick, which the surface draws as round bars.
+    let options = [(1.0, 10), (1.0, 8), (1.0, 7), (2.0, 7), (2.0, 6), (2.0, 5), (3.0, 5), (3.0, 4)];
     let mut last = None;
     let mut iterations = 0;
     for (skin, cell) in options {
@@ -2015,7 +2262,7 @@ fn lattice(p: &Problem, s: &Settings, brick: &Brick, time_left: &mut dyn FnMut()
                 continue;
             }
             let [i, j, k] = g.ijk(v);
-            let (a, b, c) = (i % cell == 0, j % cell == 0, k % cell == 0);
+            let (a, b, c) = (i % cell < 2, j % cell < 2, k % cell < 2);
             if dep[v] <= skin || (a && b) || (b && c) || (a && c) {
                 mask[v] = true;
             }
@@ -2030,7 +2277,7 @@ fn lattice(p: &Problem, s: &Settings, brick: &Brick, time_left: &mut dyn FnMut()
         last = Some((mask, chk, note));
     }
     let (mask, chk, mut note) = last.ok_or("no shape carries the load")?;
-    note.push("Auch das dichteste Gitter erreicht die Sicherheit nicht.".into());
+    note.push("Even the densest lattice does not reach the safety factor.".into());
     Ok(result(p, s, &mask, None, &chk, iterations, note))
 }
 
@@ -2336,6 +2583,10 @@ pub fn surface(g: &Grid, field: &[f64], up: usize, smooth_iters: usize, cuts: &[
         }
     }
     taubin(&mut mesh, smooth_iters, within, 0.05 * g.h);
+    // The finer the triangles and the more they were smoothed, the further the fairing reaches:
+    // about the same distance in mm, and next to nothing for a lattice's thin struts.
+    let rounds = (smooth_iters / 6).min(20);
+    fair(&mut mesh, within, 0.05 * g.h, rounds, rounds * 3 / 2);
     // Holes back to their exact radius, and nothing outside the design space's box.
     for p in &mut mesh.pos {
         for (o, ax, r) in cuts {
@@ -2354,8 +2605,8 @@ pub fn surface(g: &Grid, field: &[f64], up: usize, smooth_iters: usize, cuts: &[
     mesh
 }
 
-/// Taubin smoothing: shrink-free Laplacian smoothing.
-/// Smooths without shrinking. A vertex that lies on one of the planes (within `near`) stays
+/// Smoothing in pairs of a step towards the neighbours and a step back, after G. Taubin: it
+/// smooths while it hardly shrinks. A vertex that lies on one of the planes (within `near`) stays
 /// on it: the flat ends of a structure stay flat.
 fn taubin(m: &mut Mesh, iters: usize, planes: &[HalfSpace], near: f64) {
     let n = m.pos.len();
@@ -2377,7 +2628,10 @@ fn taubin(m: &mut Mesh, iters: usize, planes: &[HalfSpace], near: f64) {
         }
     }
     for _ in 0..iters {
-        for f in [0.5, -0.53] {
+        // The step back is as long as the step forward: what is left of the smoothing grows with
+        // the square of how fine a ripple is, so the steps of the voxels go and a round member
+        // stays as thick as it was to within a few percent.
+        for f in [0.5, -0.5] {
             let old = m.pos.clone();
             for v in 0..n {
                 if adj[v].is_empty() {
@@ -2403,6 +2657,88 @@ fn taubin(m: &mut Mesh, iters: usize, planes: &[HalfSpace], near: f64) {
     }
 }
 
+/// Takes out the fine ripples that are left, which follow the pattern of the triangles and
+/// would show as rings around a round member. The triangles' directions are averaged with
+/// their neighbours' `rounds` times, and the vertices are then moved, in `steps` steps, to
+/// where the triangles lie the way those directions say (the vertex update of Sun, Rosin,
+/// Martin and Langbein, "Fast and effective feature-preserving mesh denoising", 2007). A
+/// triangle in one of the planes keeps its direction, a vertex on a plane stays on it and no
+/// vertex goes beyond one.
+fn fair(m: &mut Mesh, planes: &[HalfSpace], near: f64, rounds: usize, steps: usize) {
+    let n = m.pos.len();
+    let planes: Vec<HalfSpace> = planes.iter().map(|(p, d)| (*p, unit(*d))).collect();
+    let on: Vec<Vec<usize>> =
+        m.pos.iter().map(|p| (0..planes.len()).filter(|&i| dot(sub(*p, planes[i].0), planes[i].1).abs() <= near).collect()).collect();
+    let flat: Vec<bool> = m.tri.iter().map(|t| (0..planes.len()).any(|i| t.iter().all(|&v| on[v].contains(&i)))).collect();
+    // Each triangle's direction, and its area as the weight it has at its corners.
+    let mut dir = vec![[0.0; 3]; m.tri.len()];
+    let mut area = vec![0.0; m.tri.len()];
+    for (f, t) in m.tri.iter().enumerate() {
+        let normal = cross(sub(m.pos[t[1]], m.pos[t[0]]), sub(m.pos[t[2]], m.pos[t[0]]));
+        let length = norm(normal);
+        if !flat[f] && length > 1e-12 {
+            dir[f] = normal.map(|c| c / length);
+            area[f] = length;
+        }
+    }
+    for _ in 0..rounds {
+        let mut at = vec![[0.0; 3]; n];
+        for (f, t) in m.tri.iter().enumerate() {
+            for &v in t {
+                for a in 0..3 {
+                    at[v][a] += area[f] * dir[f][a];
+                }
+            }
+        }
+        for (f, t) in m.tri.iter().enumerate() {
+            let sum = [0, 1, 2].map(|a| at[t[0]][a] + at[t[1]][a] + at[t[2]][a]);
+            let length = norm(sum);
+            if area[f] > 0.0 && length > 1e-12 {
+                dir[f] = sum.map(|c| c / length);
+            }
+        }
+    }
+    let mut count = vec![0.0; n];
+    for (f, t) in m.tri.iter().enumerate() {
+        if area[f] > 0.0 {
+            for &v in t {
+                count[v] += 1.0;
+            }
+        }
+    }
+    for _ in 0..steps {
+        let mut step = vec![[0.0; 3]; n];
+        for (f, t) in m.tri.iter().enumerate() {
+            if !(area[f] > 0.0) {
+                continue;
+            }
+            let middle = [0, 1, 2].map(|a| (m.pos[t[0]][a] + m.pos[t[1]][a] + m.pos[t[2]][a]) / 3.0);
+            for &v in t {
+                let off = dot(sub(middle, m.pos[v]), dir[f]);
+                for a in 0..3 {
+                    step[v][a] += off * dir[f][a];
+                }
+            }
+        }
+        for v in 0..n {
+            if !(count[v] > 0.0) {
+                continue;
+            }
+            for a in 0..3 {
+                m.pos[v][a] += step[v][a] / count[v];
+            }
+            for (i, (point, normal)) in planes.iter().enumerate() {
+                let off = dot(sub(m.pos[v], *point), *normal);
+                if on[v].contains(&i) || off < 0.0 {
+                    for a in 0..3 {
+                        m.pos[v][a] -= off * normal[a];
+                    }
+                }
+            }
+        }
+    }
+}
+
 pub fn mesh_volume(m: &Mesh) -> f64 {
     m.tri.iter().map(|t| dot(m.pos[t[0]], cross(m.pos[t[1]], m.pos[t[2]]))).sum::<f64>() / 6.0
 }
@@ -2410,6 +2746,31 @@ pub fn mesh_volume(m: &Mesh) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A flat sheet with a ripple from vertex to vertex comes out flatter, and its rim on a
+    /// plane stays on the plane.
+    #[test]
+    fn fairing_takes_out_a_ripple_and_keeps_to_the_planes() {
+        let n = 9;
+        let mut m = Mesh::default();
+        for j in 0..n {
+            for i in 0..n {
+                m.pos.push([i as f64, j as f64, if (i + j) % 2 == 0 { 0.05 } else { -0.05 }]);
+            }
+        }
+        for j in 0..n - 1 {
+            for i in 0..n - 1 {
+                let a = i + n * j;
+                m.tri.push([a, a + 1, a + n]);
+                m.tri.push([a + 1, a + n + 1, a + n]);
+            }
+        }
+        let ripple = |m: &Mesh| m.pos.iter().map(|p| p[2].abs()).sum::<f64>();
+        let before = ripple(&m);
+        fair(&mut m, &[([0.0; 3], [1.0, 0.0, 0.0])], 1e-6, 12, 20);
+        assert!(ripple(&m) < 0.3 * before, "{} of {before}", ripple(&m));
+        assert!(m.pos.iter().step_by(n).all(|p| p[0].abs() < 1e-12) && m.pos.iter().all(|p| p[0] > -1e-12));
+    }
 
     fn problem(h: f64) -> Problem {
         // A 100 x 40 x 30 block: held at x = 0 face, loaded downward at the x = 100 face.
@@ -2425,7 +2786,7 @@ mod tests {
         lv.iter().for_each(|&v| load[v] = true);
         let both: Vec<bool> = fixed.iter().zip(&load).map(|(a, b)| *a || *b).collect();
         let keep = dilate(&grid, &both, 1.0);
-        Problem { grid, fixed, load, keep, supports: vec![fv], loads: vec![lv], force: [0.0, 0.0, -300.0] }
+        Problem { grid, fixed, load, keep, supports: vec![fv], loads: vec![lv], force: [0.0, 0.0, -300.0], more: Vec::new() }
     }
 
     fn settings(style: Style) -> Settings {
@@ -2437,6 +2798,9 @@ mod tests {
             min_wall: 2.0,
             max_deflection: 0.0,
             accelerate: false,
+            symmetry: [false; 3],
+            extrude: None,
+            print: None,
         }
     }
 
@@ -2569,7 +2933,7 @@ mod bench {
         let mut load = none.clone();
         load[g.len() - 1] = true;
         let t = std::time::Instant::now();
-        let fem = Fem::new(&g, &brick, elems, &fixed, &load, [0.0, 0.0, -1.0], false);
+        let fem = Fem::new(&g, &brick, elems, &fixed, &load, [0.0, 0.0, -1.0], &[], false);
         println!(
             "build {:?} levels {} ndof {:?}",
             t.elapsed(),

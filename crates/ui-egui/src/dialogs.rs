@@ -270,6 +270,10 @@ crate::dialog_descriptor::dialog_descriptors! {
                 force: String,
                 direction: usize,
                 vector: String,
+                /// The force on the further loaded faces (empty: as much as `force`) and its
+                /// direction, as `direction`.
+                force2: String,
+                direction2: usize,
                 style: usize,
                 detail: usize,
                 material: usize,
@@ -279,6 +283,16 @@ crate::dialog_descriptor::dialog_descriptors! {
                 wall: String,
                 deflection: String,
                 margin: String,
+                /// 0: as light as carries the force; 1: the stiffest shape of `keep` percent
+                /// of the design space.
+                goal: usize,
+                keep: String,
+                /// Indexes [`super::GENERATIVE_MIRRORS`] and [`super::GENERATIVE_MAKING`].
+                mirror: usize,
+                making: usize,
+                clearance: String,
+                /// The time limit in minutes.
+                time: String,
             },
             /// A construction axis, point or plane made from picks alone (#2474): input `i` is the
             /// command's parameter `keys[i]`, and `t` (along a path) when it takes one.
@@ -1065,6 +1079,8 @@ impl Dialog {
                     force: "100".into(),
                     direction: 5,
                     vector: String::new(),
+                    force2: String::new(),
+                    direction2: 5,
                     style: 0,
                     detail: 1,
                     material: 1,
@@ -1074,12 +1090,19 @@ impl Dialog {
                     wall: String::new(),
                     deflection: String::new(),
                     margin: String::new(),
+                    goal: 0,
+                    keep: String::new(),
+                    mirror: 0,
+                    making: 0,
+                    clearance: String::new(),
+                    time: String::new(),
                 },
                 vec![
                     SelInput::new("Held faces", FACES, true),
                     SelInput::new("Loaded faces", FACES, true),
                     SelInput::new("Bodies to avoid", BODIES, true),
                     SelInput::new("Design space", BODIES, false),
+                    SelInput::new("More loaded faces", FACES, true),
                 ],
             ),
             // Plane, Axis and Point open as the method their picks call for (`dialogs_auto`).
@@ -4611,6 +4634,23 @@ pub(crate) const GENERATIVE_DIRECTIONS: [(&str, [f64; 3]); 6] = [
 pub(crate) const GENERATIVE_STYLES: [(&str, &str); 3] = [("Organic", "organic"), ("Tree", "tree"), ("Lattice", "lattice")];
 /// A generative design's levels of detail: the label and the cells to compute with.
 pub(crate) const GENERATIVE_DETAIL: [(&str, f64); 4] = [("Coarse", 40_000.0), ("Medium", 120_000.0), ("Fine", 400_000.0), ("Very fine", 1_200_000.0)];
+/// The planes a generative design can be mirrored in: the label and the engine's axes.
+pub(crate) const GENERATIVE_MIRRORS: [(&str, &str); 8] =
+    [("None", ""), ("X", "x"), ("Y", "y"), ("Z", "z"), ("X and Y", "xy"), ("X and Z", "xz"), ("Y and Z", "yz"), ("X, Y and Z", "xyz")];
+/// How a generative design is going to be made: the label, and the engine's parameter and its
+/// value. Printed, it stands without supports; cut, it has one section all along the axis.
+pub(crate) const GENERATIVE_MAKING: [(&str, &str, &str); 10] = [
+    ("Unrestricted", "", ""),
+    ("3D print, +Z up", "print", "+z"),
+    ("3D print, -Z up", "print", "-z"),
+    ("3D print, +X up", "print", "+x"),
+    ("3D print, -X up", "print", "-x"),
+    ("3D print, +Y up", "print", "+y"),
+    ("3D print, -Y up", "print", "-y"),
+    ("Cut along X", "extrude", "x"),
+    ("Cut along Y", "extrude", "y"),
+    ("Cut along Z", "extrude", "z"),
+];
 /// Materials a generative design can be sized for: the label, the strength and the stiffness
 /// (modulus of elasticity) in MPa, as data sheets commonly give them. The last leaves the
 /// fields as typed.
@@ -6095,7 +6135,28 @@ fn dialog_commands(app: &SolveApp, d: &Dialog) -> Result<Vec<(String, Value)>, S
                 None => ("construct.plane.offset", json!({"base": base, "through": null})),
             }
         }
-        Kind::Generative { force, direction, vector, style, detail, strength, modulus, safety, wall, deflection, margin, .. } => {
+        Kind::Generative {
+            force,
+            direction,
+            vector,
+            force2,
+            direction2,
+            style,
+            detail,
+            strength,
+            modulus,
+            safety,
+            wall,
+            deflection,
+            margin,
+            goal,
+            keep,
+            mirror,
+            making,
+            clearance,
+            time,
+            ..
+        } => {
             need(0, "the held faces")?;
             need(1, "the loaded faces")?;
             // A number as typed, with a decimal comma or point; an empty field is none.
@@ -6151,10 +6212,26 @@ fn dialog_commands(app: &SolveApp, d: &Dialog) -> Result<Vec<(String, Value)>, S
                     ("wall", wall, "the thinnest member in mm"),
                     ("deflection", deflection, "the largest deflection in mm"),
                     ("margin", margin, "the room around in mm"),
+                    ("clearance", clearance, "the clearance in mm"),
                 ] {
                     if let Some(n) = number(text, what)? {
                         o.insert(key.into(), json!(n));
                     }
+                }
+                if *goal == 1 {
+                    o.insert("goal".into(), json!("stiffest"));
+                    if let Some(n) = number(keep, "the material to keep in percent")? {
+                        o.insert("keep".into(), json!(n));
+                    }
+                }
+                if let Some((_, axes)) = GENERATIVE_MIRRORS.get(*mirror).filter(|m| !m.1.is_empty()) {
+                    o.insert("symmetry".into(), json!(axes));
+                }
+                if let Some((_, key, value)) = GENERATIVE_MAKING.get(*making).filter(|m| !m.1.is_empty()) {
+                    o.insert((*key).into(), json!(value));
+                }
+                if let Some(minutes) = number(time, "the time limit in minutes")? {
+                    o.insert("time".into(), json!(minutes * 60.0));
                 }
                 let avoid = bodies(2);
                 if !avoid.is_empty() {
@@ -6162,6 +6239,14 @@ fn dialog_commands(app: &SolveApp, d: &Dialog) -> Result<Vec<(String, Value)>, S
                 }
                 if let Some(space) = bodies(3).into_iter().next() {
                     o.insert("space".into(), json!(space));
+                }
+                // Further faces with a force of their own, acting at the same time.
+                let further = faces(4);
+                if !further.is_empty() {
+                    // With no second force typed, they carry as much as the loaded faces.
+                    let second = number(force2, "the second force in newtons")?.unwrap_or(newtons);
+                    let way = GENERATIVE_DIRECTIONS.get(*direction2).map_or([0.0, 0.0, -1.0], |(_, v)| *v);
+                    o.insert("loads".into(), json!([{"faces": further, "force": way.map(|c| c * second)}]));
                 }
             }
             ("generative.design", params)

@@ -977,12 +977,37 @@ fn additional_rows(app: &mut SolveApp, d: &mut Dialog, ui: &mut egui::Ui) -> boo
         Kind::MeshConvert { tolerance } => {
             form_row(ui, "Tolerance", |ui| enter |= field(ui, tolerance));
         }
-        Kind::Generative { force, direction, vector, style, detail, material, strength, modulus, safety, wall, deflection, margin } => {
+        Kind::Generative {
+            force,
+            direction,
+            vector,
+            force2,
+            direction2,
+            style,
+            detail,
+            material,
+            strength,
+            modulus,
+            safety,
+            wall,
+            deflection,
+            margin,
+            goal,
+            keep,
+            mirror,
+            making,
+            clearance,
+            time,
+        } => {
             form_row(ui, "Force (N)", |ui| enter |= field(ui, force));
             form_row(ui, "Direction", |ui| {
                 ui_kit::segmented(ui, direction, &GENERATIVE_DIRECTIONS.map(|(label, _)| label), Default::default());
             });
             enter |= hint_row(ui, "Direction (x, y, z)", vector, tr("as chosen above"));
+            enter |= hint_row_positive(ui, "Second force (N)", force2, tr("as chosen above"));
+            form_row(ui, "Second direction", |ui| {
+                ui_kit::segmented(ui, direction2, &GENERATIVE_DIRECTIONS.map(|(label, _)| label), Default::default());
+            });
             form_row(ui, "Style", |ui| {
                 ui_kit::segmented(ui, style, &GENERATIVE_STYLES.map(|(label, _)| label), Default::default());
             });
@@ -1003,6 +1028,16 @@ fn additional_rows(app: &mut SolveApp, d: &mut Dialog, ui: &mut egui::Ui) -> boo
             enter |= hint_row_positive(ui, "Thinnest member (mm)", wall, tr("automatic"));
             enter |= hint_row_positive(ui, "Largest deflection (mm)", deflection, tr("automatic"));
             enter |= hint_row_positive(ui, "Room around (mm)", margin, tr("none"));
+            form_row(ui, "Goal", |ui| {
+                ui_kit::segmented(ui, goal, &["Lightest", "Stiffest"], Default::default());
+            });
+            if *goal == 1 {
+                enter |= hint_row_positive(ui, "Material to keep (%)", keep, "20");
+            }
+            choice_row(ui, "Mirror", "generative_mirror", mirror, &GENERATIVE_MIRRORS.map(|(label, _)| label));
+            choice_row(ui, "Manufacturing", "generative_making", making, &GENERATIVE_MAKING.map(|(label, ..)| label));
+            enter |= hint_row_positive(ui, "Clearance (mm)", clearance, tr("none"));
+            enter |= hint_row_positive(ui, "Time limit (min)", time, "15");
         }
         Kind::Construct { t: Some(t), .. } => {
             form_row(ui, "Position (0 to 1)", |ui| enter |= field(ui, t));

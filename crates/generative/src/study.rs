@@ -20,11 +20,16 @@ pub struct Study {
     pub load: Vec<FaceTris>,
     /// The force in newtons.
     pub force: V3,
+    /// Further loads acting at the same time: faces and the force on them, in newtons.
+    pub more: Vec<(Vec<FaceTris>, V3)>,
     /// The body to carve the structure out of; `None`: the box around the picked faces.
     pub space: Option<Mesh>,
     /// Closed bodies the structure stays out of. With no `space`, the bodies of the picked
     /// faces belong here.
     pub obstacles: Vec<Mesh>,
+    /// Further closed bodies the structure stays out of, and `clearance` mm away from.
+    pub avoid: Vec<Mesh>,
+    pub clearance: f64,
     /// How far the design box reaches beyond the picked faces, in mm.
     pub margin: f64,
     /// How many cells to divide the design space into.
@@ -75,7 +80,8 @@ pub fn plane_of(tris: &[[V3; 3]]) -> Option<HalfSpace> {
     tris.iter().flatten().all(|p| dot(sub(*p, point), normal).abs() < 1e-4).then_some((point, normal))
 }
 
-/// The pieces of a mesh that reach one of the planes.
+/// The pieces of a mesh that reach one of the planes, and the hollows inside: a closed surface
+/// that faces inwards is the wall of a hollow, which a lattice has behind its skin.
 fn standing(mesh: Mesh, planes: &[HalfSpace]) -> Mesh {
     let mut parent: Vec<usize> = (0..mesh.pos.len()).collect();
     fn root(parent: &mut [usize], mut v: usize) -> usize {
@@ -99,10 +105,15 @@ fn standing(mesh: Mesh, planes: &[HalfSpace]) -> Mesh {
             stands[r] = true;
         }
     }
+    let mut volume = vec![0.0; mesh.pos.len()];
+    for t in &mesh.tri {
+        volume[root(&mut parent, t[0])] += dot(mesh.pos[t[0]], cross(mesh.pos[t[1]], mesh.pos[t[2]]));
+    }
     let mut new_id = vec![usize::MAX; mesh.pos.len()];
     let mut out = Mesh::default();
     for t in &mesh.tri {
-        if !stands[root(&mut parent, t[0])] {
+        let piece = root(&mut parent, t[0]);
+        if !stands[piece] && volume[piece] >= 0.0 {
             continue;
         }
         out.tri.push(t.map(|v| {
@@ -194,7 +205,16 @@ fn extent(study: &Study, held: &[Face], load: &[Face]) -> Result<(V3, V3, f64), 
 /// The study's problem on a grid of about `voxels` cells, for members `wall` mm thick. With
 /// `band`, a coarser level's grid and the cells around its structure, only the cells there are
 /// design space: a finer level works the structure out where the coarser one found it.
-fn level(study: &Study, held: &[Face], load: &[Face], voxels: f64, wall: f64, band: Option<(&Grid, &[bool])>) -> Result<Level, String> {
+/// `load` holds the faces of every load; `more` says which of them carry a further force.
+fn level(
+    study: &Study,
+    held: &[Face],
+    load: &[Face],
+    more: &[(std::ops::Range<usize>, V3)],
+    voxels: f64,
+    wall: f64,
+    band: Option<(&Grid, &[bool])>,
+) -> Result<Level, String> {
     let boxed = study.space.is_none();
     let (lo, hi, volume) = extent(study, held, load)?;
     let h = (volume / voxels).cbrt().max(0.05);
@@ -238,6 +258,18 @@ fn level(study: &Study, held: &[Face], load: &[Face], voxels: f64, wall: f64, ba
             }
         }
     }
+    for mesh in &study.avoid {
+        let mut mask = gv::mesh_mask(&grid, mesh);
+        if study.clearance > 0.0 {
+            mask = gv::dilate(&grid, &mask, (study.clearance / h).min(8.0));
+        }
+        for v in 0..grid.len() {
+            if mask[v] {
+                grid.inside[v] = false;
+                blocked[v] = true;
+            }
+        }
+    }
     if let Some((coarse, around)) = band {
         for v in 0..grid.len() {
             if grid.inside[v] && !coarse.at(grid.center(v)).is_some_and(|w| around[w]) {
@@ -271,6 +303,8 @@ fn level(study: &Study, held: &[Face], load: &[Face], voxels: f64, wall: f64, ba
             let small = area <= 25.0 * wall * wall;
             let outline = outline_of(f.tris);
             let inset = if small { 0.0 } else { wall.min(0.25 * area.sqrt()) };
+            // The cover of a small face is a good half member thick, and a cell at least.
+            let cover_to = if small { h.max(0.6 * wall) } else { 0.0 };
             let mut behind = Vec::new();
             let mut front = Vec::new();
             // A face narrower than a cell still gets the cells along it.
@@ -280,7 +314,7 @@ fn level(study: &Study, held: &[Face], load: &[Face], voxels: f64, wall: f64, ba
                 for v in 0..grid.len() {
                     let c = grid.center(v);
                     let depth = dot(sub(c, point), normal);
-                    if !(depth > -deep && depth < 1.25 * h) {
+                    if !(depth > -deep && depth < cover_to.max(1.25 * h)) {
                         continue;
                     }
                     let foot = [0, 1, 2].map(|a| c[a] - depth * normal[a]);
@@ -288,11 +322,13 @@ fn level(study: &Study, held: &[Face], load: &[Face], voxels: f64, wall: f64, ba
                     if aside <= reach && depth < 0.0 {
                         behind.push(v);
                     } else if aside <= reach && !(inset > 0.0 && outline.iter().any(|[a, b]| segment_distance(foot, *a, *b) < inset)) {
-                        on_face[v] = true;
-                        if small && depth < h {
+                        if depth < 1.25 * h {
+                            on_face[v] = true;
+                        }
+                        if depth < cover_to {
                             front.push(v);
                         }
-                    } else if depth > -0.9 * h {
+                    } else if depth > -0.9 * h && depth < 1.25 * h {
                         beside[v] = true;
                     }
                 }
@@ -304,6 +340,13 @@ fn level(study: &Study, held: &[Face], load: &[Face], voxels: f64, wall: f64, ba
                 cover[v] = !blocked[v];
             }
             slabs.push(((point, normal), behind));
+        }
+        // A curved picked face gets a collar a good half member thick, and more than a cell:
+        // the structure grows out of it.
+        for f in held.iter().chain(load).filter(|f| f.plane.is_none()) {
+            for v in gv::voxels_near(&grid, f.tris, (1.6 * h).max(0.6 * wall)) {
+                cover[v] = !blocked[v];
+            }
         }
         for v in 0..grid.len() {
             if beside[v] && !on_face[v] {
@@ -328,9 +371,9 @@ fn level(study: &Study, held: &[Face], load: &[Face], voxels: f64, wall: f64, ba
         let mut set = vec![false; grid.len()];
         let mut each = Vec::new();
         for f in faces {
-            let near = match (f.plane, flat.next()) {
-                (Some(_), Some((_, behind))) => behind.clone(),
-                _ => gv::voxels_near(&grid, f.tris, 0.9 * h),
+            let near = match f.plane.and_then(|_| flat.next()) {
+                Some((_, behind)) => behind.clone(),
+                None => gv::voxels_near(&grid, f.tris, 0.9 * h),
             };
             for &v in &near {
                 set[v] = true;
@@ -346,21 +389,42 @@ fn level(study: &Study, held: &[Face], load: &[Face], voxels: f64, wall: f64, ba
     }
     let both: Vec<bool> = fixed.iter().zip(&loaded).map(|(a, b)| *a || *b).collect();
     let keep = if boxed { both.iter().zip(&cover).map(|(a, b)| *a || *b).collect() } else { gv::dilate(&grid, &both, 1.5) };
-    Ok(Level { problem: Problem { grid, fixed, load: loaded, keep, supports, loads, force: study.force }, clip, within, slabs, round })
+    let more = more
+        .iter()
+        .map(|(faces, force)| {
+            let mut on = vec![false; grid.len()];
+            for &v in loads.get(faces.clone()).into_iter().flatten().flatten() {
+                on[v] = true;
+            }
+            (on, *force)
+        })
+        .collect();
+    Ok(Level { problem: Problem { grid, fixed, load: loaded, keep, supports, loads, force: study.force, more }, clip, within, slabs, round })
 }
 
 /// Runs the study. `time_left` is asked between steps; when it says no, the best shape so far
 /// is finished.
 pub fn run(study: &Study, time_left: &mut dyn FnMut() -> bool) -> Result<Report, String> {
-    if study.held.is_empty() || study.load.is_empty() || study.held.iter().chain(&study.load).any(Vec::is_empty) {
+    let further = study.more.iter().flat_map(|(faces, _)| faces);
+    if study.held.is_empty()
+        || study.load.is_empty()
+        || study.held.iter().chain(&study.load).chain(further).any(Vec::is_empty)
+        || study.more.iter().any(|(faces, _)| faces.is_empty())
+    {
         return Err("give at least one held face and one loaded face".into());
     }
-    if !(study.voxels >= 1.0 && study.voxels <= MAX_CELLS as f64 && study.margin >= 0.0 && study.margin.is_finite()) {
+    if !(study.voxels >= 1.0 && study.voxels <= MAX_CELLS as f64 && study.margin >= 0.0 && study.margin.is_finite() && study.clearance >= 0.0) {
         return Err("the cell count or the margin is out of range".into());
     }
     let boxed = study.space.is_none();
     let held = faces(&study.held, boxed);
-    let load = faces(&study.load, boxed);
+    let mut load = faces(&study.load, boxed);
+    let mut more = Vec::new();
+    for (on, force) in &study.more {
+        let from = load.len();
+        load.extend(faces(on, boxed));
+        more.push((from..load.len(), *force));
+    }
     // An organic structure is found on a coarse grid first and worked out on finer ones, each
     // with eight times the cells but only around the structure the one before found: fine
     // members at a fraction of the work a fine grid all over would be.
@@ -383,14 +447,22 @@ pub fn run(study: &Study, time_left: &mut dyn FnMut() -> bool) -> Result<Report,
         settings.max_deflection = longest / 300.0;
     }
     let mut done: Option<(Level, Outcome)> = None;
+    let mut space: Option<f64> = None;
     for &voxels in &sizes {
         let around = done.as_ref().map(|(l, o)| {
             let solid: Vec<bool> = o.field.iter().map(|f| *f > 0.5).collect();
             gv::dilate(&l.problem.grid, &solid, 2.5)
         });
         let band = done.as_ref().zip(around.as_deref()).map(|((l, _), a)| (&l.problem.grid, a));
-        let next = level(study, &held, &load, voxels, settings.min_wall, band)?;
+        let next = level(study, &held, &load, &more, voxels, settings.min_wall, band)?;
         let g = &next.problem.grid;
+        // A share of the design space to fill is a share of the whole of it, also on a finer
+        // level that only has the cells around the structure.
+        if let Some(share) = study.settings.volume {
+            let free = (0..g.len()).filter(|&v| g.inside[v] && !next.problem.keep[v]).count() as f64 * g.h.powi(3);
+            let whole = *space.get_or_insert(free);
+            settings.volume = Some((share * whole / free.max(1e-9)).clamp(0.01, 0.95));
+        }
         let outcome = match &done {
             None => gv::generate(&next.problem, &settings, time_left)?,
             Some((before, coarse)) => {
@@ -432,8 +504,23 @@ pub fn run(study: &Study, time_left: &mut dyn FnMut() -> bool) -> Result<Report,
             }
         }
     }
-    let up = if g.len() > 400_000 { 1 } else { 2 };
-    let mesh = gv::surface(g, &field, up, 40, &[], clip, &within);
+    // Three times as fine as the cells, so that a member two cells thick comes out round, with
+    // about 45 triangles to a cell on the surface; coarser where that would make more
+    // triangles than a design is good to work with.
+    let skin = (0..g.len()).filter(|&v| field[v] > 0.5 && g.on_surface_of(v, |w| field[w] > 0.5)).count();
+    let up = match skin {
+        0..=8_000 => 3,
+        8_001..=60_000 => 2,
+        _ => 1,
+    };
+    // The same smoothing in mm whatever the fineness. A lattice's struts are two cells thick:
+    // they are drawn at a lower level of the field, where they come out as thick as they are,
+    // and smoothed less, which would thin them.
+    let lattice = study.settings.style == gv::Style::Lattice;
+    if lattice {
+        field.iter_mut().for_each(|f| *f *= 1.5);
+    }
+    let mesh = gv::surface(g, &field, up, if lattice { 4 * up * up } else { 15 * up * up }, &[], clip, &within);
     // Loose crumbs carry nothing: only pieces that stand on a held face stay.
     let held_planes: Vec<HalfSpace> = held.iter().filter_map(|f| f.plane).collect();
     let mesh = if held_planes.len() == held.len() { standing(mesh, &held_planes) } else { mesh };
