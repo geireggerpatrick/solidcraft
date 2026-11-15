@@ -1054,6 +1054,7 @@ fn additional_rows(app: &mut SolveApp, d: &mut Dialog, ui: &mut egui::Ui) -> boo
             mirror,
             making,
             clearance,
+            result,
             time,
         } => {
             form_row(ui, "Style", |ui| {
@@ -1085,6 +1086,9 @@ fn additional_rows(app: &mut SolveApp, d: &mut Dialog, ui: &mut egui::Ui) -> boo
             choice_row(ui, "Mirror", "generative_mirror", mirror, &GENERATIVE_MIRRORS.map(|(label, _)| label));
             choice_row(ui, "Manufacturing", "generative_making", making, &GENERATIVE_MAKING.map(|(label, ..)| label));
             enter |= hint_row_positive(ui, "Clearance (mm)", clearance, tr("none"));
+            form_row(ui, "Result", |ui| {
+                ui_kit::segmented(ui, result, &["Mesh body", "Solid body"], Default::default());
+            });
             enter |= hint_row_positive(ui, "Time limit (min)", time, "15");
         }
         Kind::Construct { t: Some(t), .. } => {

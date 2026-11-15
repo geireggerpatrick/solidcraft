@@ -64,9 +64,9 @@ fn a_large_meshs_levels_are_made_once_on_a_worker() {
     assert!(lods.levels(&mesh).is_none(), "made again when asked again");
 }
 
-/// A smoothly shaded mesh has smoothly shaded levels: on a sphere every corner of a level is
-/// lit straight away from the centre (within two degrees), where its triangles' own normals are
-/// several degrees off and would show as facets.
+/// A smoothly shaded mesh has smoothly shaded levels: on a sphere the corners that meet in a
+/// point of a level are lit alike, away from the centre (within eight degrees on the coarsest
+/// level), so no triangle shows as a facet.
 #[test]
 fn a_smooth_meshs_levels_are_shaded_smoothly() {
     let mut mesh = (*sphere(110)).clone();
@@ -78,11 +78,14 @@ fn a_smooth_meshs_levels_are_shaded_smoothly() {
     for (tris, _) in &levels {
         assert!(!tris.flat);
         let mut worst = 1.0f32;
+        let mut lit = std::collections::HashMap::new();
         for (p, n) in tris.corners().flatten() {
             let length = (p[0] * p[0] + p[1] * p[1] + p[2] * p[2]).sqrt();
             worst = worst.min((p[0] * n[0] + p[1] * n[1] + p[2] * n[2]) / length);
+            let first = *lit.entry(p.map(f32::to_bits)).or_insert(n);
+            assert!((0..3).all(|k| (first[k] - n[k]).abs() < 1e-4), "one point lit two ways: {first:?} and {n:?}");
         }
-        assert!(worst > 2.0f32.to_radians().cos(), "a corner's normal is {} degrees off", worst.acos().to_degrees());
+        assert!(worst > 8.0f32.to_radians().cos(), "a corner's normal is {} degrees off", worst.acos().to_degrees());
     }
     // A mesh of flat triangles keeps flat levels.
     assert!(make(&sphere(110)).iter().all(|(tris, _)| tris.flat));

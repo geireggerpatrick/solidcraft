@@ -145,6 +145,11 @@ pub struct GenerativeDesignParams {
     /// by then is finished. Default: 900.
     #[serde(default)]
     pub time: Option<f64>,
+    /// `true`: the structure is rebuilt as a solid body of flat faces, which Combine, cuts and
+    /// holes work on. A fine structure is simplified to 40 000 triangles first, and the
+    /// rebuilding takes a minute or more. Default: `false`, a mesh body.
+    #[serde(default)]
+    pub solid: Option<bool>,
     /// The feature's name in the timeline.
     #[serde(default)]
     pub name: Option<String>,

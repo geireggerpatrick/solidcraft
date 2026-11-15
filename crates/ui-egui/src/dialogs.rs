@@ -285,6 +285,8 @@ crate::dialog_descriptor::dialog_descriptors! {
                 mirror: usize,
                 making: usize,
                 clearance: String,
+                /// 0: a mesh body; 1: a solid body of flat faces.
+                result: usize,
                 /// The time limit in minutes.
                 time: String,
             },
@@ -1086,6 +1088,7 @@ impl Dialog {
                     mirror: 0,
                     making: 0,
                     clearance: String::new(),
+                    result: 0,
                     time: String::new(),
                 },
                 // The faces of the second load and the ones after it follow, shown as loads are added.
@@ -6200,6 +6203,7 @@ pub(crate) fn dialog_commands(app: &SolveApp, d: &Dialog) -> Result<Vec<(String,
             mirror,
             making,
             clearance,
+            result,
             time,
             ..
         } => {
@@ -6277,6 +6281,9 @@ pub(crate) fn dialog_commands(app: &SolveApp, d: &Dialog) -> Result<Vec<(String,
                 }
                 if let Some((_, key, value)) = GENERATIVE_MAKING.get(*making).filter(|m| !m.1.is_empty()) {
                     o.insert((*key).into(), json!(value));
+                }
+                if *result == 1 {
+                    o.insert("solid".into(), json!(true));
                 }
                 if let Some(minutes) = number(time, "the time limit in minutes")? {
                     o.insert("time".into(), json!(minutes * 60.0));

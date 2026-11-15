@@ -80,7 +80,8 @@
     "Load 5": "الحمل 5",
     "Load 6": "الحمل 6",
     "Load 7": "الحمل 7",
-    "Load 8": "الحمل 8"
+    "Load 8": "الحمل 8",
+    "Solid body": "جسم مصمت"
   },
   "de": {
     "cmd.generative_design": "Generatives Design",
@@ -163,7 +164,8 @@
     "Load 5": "Last 5",
     "Load 6": "Last 6",
     "Load 7": "Last 7",
-    "Load 8": "Last 8"
+    "Load 8": "Last 8",
+    "Solid body": "Volumenkörper"
   },
   "en": {
     "cmd.generative_design": "Generative Design",
@@ -246,7 +248,8 @@
     "Load 5": "Load 5",
     "Load 6": "Load 6",
     "Load 7": "Load 7",
-    "Load 8": "Load 8"
+    "Load 8": "Load 8",
+    "Solid body": "Solid body"
   },
   "he": {
     "cmd.generative_design": "תכנון גנרטיבי",
@@ -329,7 +332,8 @@
     "Load 5": "עומס 5",
     "Load 6": "עומס 6",
     "Load 7": "עומס 7",
-    "Load 8": "עומס 8"
+    "Load 8": "עומס 8",
+    "Solid body": "גוף מוצק"
   },
   "ja": {
     "cmd.generative_design": "ジェネレーティブデザイン",
@@ -412,7 +416,8 @@
     "Load 5": "荷重 5",
     "Load 6": "荷重 6",
     "Load 7": "荷重 7",
-    "Load 8": "荷重 8"
+    "Load 8": "荷重 8",
+    "Solid body": "ソリッドボディ"
   },
   "ko": {
     "cmd.generative_design": "제너레이티브 디자인",
@@ -495,7 +500,8 @@
     "Load 5": "하중 5",
     "Load 6": "하중 6",
     "Load 7": "하중 7",
-    "Load 8": "하중 8"
+    "Load 8": "하중 8",
+    "Solid body": "솔리드 바디"
   },
   "vi": {
     "cmd.generative_design": "Thiết kế tạo sinh",
@@ -578,7 +584,8 @@
     "Load 5": "Tải 5",
     "Load 6": "Tải 6",
     "Load 7": "Tải 7",
-    "Load 8": "Tải 8"
+    "Load 8": "Tải 8",
+    "Solid body": "Khối đặc"
   },
   "zh": {
     "cmd.generative_design": "创成式设计",
@@ -661,6 +668,7 @@
     "Load 5": "载荷 5",
     "Load 6": "载荷 6",
     "Load 7": "载荷 7",
-    "Load 8": "载荷 8"
+    "Load 8": "载荷 8",
+    "Solid body": "实体"
   }
 }

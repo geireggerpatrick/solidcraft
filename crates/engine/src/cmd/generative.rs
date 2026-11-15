@@ -13,6 +13,9 @@ use crate::schema::{Point3, TypedContract, output_schema_for};
 use crate::{Result, Session, params::bad};
 
 const CMD: &str = "generative.design";
+/// The most triangles a structure has when it is rebuilt as a solid: what the mesh conversion
+/// takes, with room to spare.
+const SOLID_TRIANGLES: usize = 40_000;
 const DESIGN_CONTRACT: TypedContract<GenerativeDesignParams> = TypedContract::new();
 
 pub static COMMANDS: &[CommandSpec] = &[
@@ -20,7 +23,7 @@ pub static COMMANDS: &[CommandSpec] = &[
         .icon("import")
         .contract(&DESIGN_CONTRACT)
         .output(output_schema_for::<GenerativeDesignResult>)
-        .params("held: [{body, point: [x,y,z]}] (faces that are held); slide?: [{body, point}] (faces held along their normal only, which slide in their surface); pin?: [{body, point}] (round faces on a pin: free to turn about it); load: [{body, point: [x,y,z]}] (faces the first load acts on); force: [x,y,z] in newtons, or moment: [x,y,z] in newton metres about the middle of the faces, or pressure: MPa onto the faces; loads?: [{faces: [{body, point}], force | moment | pressure, case?: 1…8}] (further loads; those of case 1, the default, act at the same time as `load`, each other case acts on its own and the structure carries every case); style?: organic|tree|lattice (default organic); space?: body to carve the structure out of (default: the box around the picked faces, around the bodies they belong to, which stay as they are); avoid?: [body] (further bodies to stay clear of); clearance?: mm to stay away from them; margin?: mm the design box reaches beyond the faces; strength?: MPa (default 35); modulus?: MPa (default 1900); safety?: 1…20 (default 2); voxels?: 500…2000000 cells (default 40000); wall?: thinnest strut in mm (default: two and a half cells, at least 1.5 % of the design space's longest side); deflection?: the most the loaded faces may move, in mm (default: 1/300 of the design space's longest side); goal?: lightest|stiffest; keep?: percent of the design space to fill for stiffest (default 20); symmetry?: axes to mirror in, such as x or xy; extrude?: x|y|z (one section along that axis); print?: +x|-x|+y|-y|+z|-z (stands without supports when printed that way up); time?: seconds the computation may take (default 900); name?; body_name? (default Generative): a new mesh body that carries the force from the loaded to the held faces with as little material as the strength allows"),
+        .params("held: [{body, point: [x,y,z]}] (faces that are held); slide?: [{body, point}] (faces held along their normal only, which slide in their surface); pin?: [{body, point}] (round faces on a pin: free to turn about it); load: [{body, point: [x,y,z]}] (faces the first load acts on); force: [x,y,z] in newtons, or moment: [x,y,z] in newton metres about the middle of the faces, or pressure: MPa onto the faces; loads?: [{faces: [{body, point}], force | moment | pressure, case?: 1…8}] (further loads; those of case 1, the default, act at the same time as `load`, each other case acts on its own and the structure carries every case); style?: organic|tree|lattice (default organic); space?: body to carve the structure out of (default: the box around the picked faces, around the bodies they belong to, which stay as they are); avoid?: [body] (further bodies to stay clear of); clearance?: mm to stay away from them; margin?: mm the design box reaches beyond the faces; strength?: MPa (default 35); modulus?: MPa (default 1900); safety?: 1…20 (default 2); voxels?: 500…2000000 cells (default 40000); wall?: thinnest strut in mm (default: two and a half cells, at least 1.5 % of the design space's longest side); deflection?: the most the loaded faces may move, in mm (default: 1/300 of the design space's longest side); goal?: lightest|stiffest; keep?: percent of the design space to fill for stiffest (default 20); symmetry?: axes to mirror in, such as x or xy; extrude?: x|y|z (one section along that axis); print?: +x|-x|+y|-y|+z|-z (stands without supports when printed that way up); time?: seconds the computation may take (default 900); solid?: true for a solid body of flat faces that Combine and cuts work on (default false: a mesh body); name?; body_name? (default Generative): a new mesh body that carries the force from the loaded to the held faces with as little material as the strength allows"),
 ];
 
 fn v3(p: Vec3) -> V3 {
@@ -302,6 +305,7 @@ fn design(s: &mut Session, p: &Value) -> Result<Value> {
         return Err(bad(CMD, "the result has too many triangles; give fewer `voxels`"));
     }
     let name = q.body_name.as_deref().map(str::trim).filter(|n| !n.is_empty()).unwrap_or("Generative").to_string();
+    let solid = q.solid == Some(true);
     let mut data = MeshData {
         name,
         positions: mesh.pos.iter().flatten().copied().collect(),
@@ -309,6 +313,15 @@ fn design(s: &mut Session, p: &Value) -> Result<Value> {
         corner_normals: Default::default(),
         color: None,
     };
+    // A solid has a face for each triangle: a fine structure gets fewer, larger ones first.
+    if solid && mesh.tri.len() > SOLID_TRIANGLES {
+        let points: Vec<Vec3> = mesh.pos.iter().map(|p| Vec3::new(p[0], p[1], p[2])).collect();
+        let triangles: Vec<[u32; 3]> = mesh.tri.iter().map(|t| t.map(|v| v as u32)).collect();
+        if let Some(level) = crate::geom::simplify::levels(&points, &triangles, &[SOLID_TRIANGLES]).pop() {
+            data.positions = level.positions.iter().flat_map(|p| [p.x, p.y, p.z]).collect();
+            data.triangles = level.triangles.iter().flatten().copied().collect();
+        }
+    }
     // Shaded as the round shape it is, not as its triangles: only the flat cuts on the picked
     // faces keep their edge.
     data.generate_crease_normals(60.0).map_err(|e| bad(CMD, e.to_string()))?;
@@ -316,7 +329,20 @@ fn design(s: &mut Session, p: &Value) -> Result<Value> {
     even_normals(&data.triangles, &mut normals, 4);
     data.corner_normals = normals.into();
     let mut reply = add_feature(s, p, FeatureKind::MeshImport { file: "generative design".into(), meshes: vec![data] })?;
+    // The mesh body rebuilt as a solid; if that fails, the mesh body stays and the reply says why.
+    let mut unsolid = None;
+    if solid {
+        let made = reply.get("created_bodies").and_then(Value::as_array).and_then(|bodies| bodies.first()).and_then(Value::as_str).map(str::to_owned);
+        let converted = match made {
+            Some(body) => add_feature(s, &Value::Null, FeatureKind::MeshConvert { body: body.into(), tolerance: "0.05 mm".into() }).map(|_| ()),
+            None => Err(bad(CMD, "no body came out")),
+        };
+        unsolid = converted.err().map(|e| format!("the structure stays a mesh body, it could not be rebuilt as a solid: {e}"));
+    }
     if let Some(o) = reply.as_object_mut() {
+        if let Some(text) = unsolid {
+            o.insert("warning".into(), Value::String(text));
+        }
         if !outcome.passed {
             let text = format!(
                 "the structure reaches {:.1} MPa where {:.1} MPa are allowed; give it more room, a stronger material or a smaller force",
@@ -405,6 +431,18 @@ mod tests {
         let st = s.model.state();
         let body = st.bodies.iter().find(|b| b.name == "Generative").expect("the new body");
         assert!(body.body.is_closed_mesh());
+    }
+
+    /// Asked for as a solid, the structure is a body of faces that the modelling commands
+    /// work on, not a mesh.
+    #[test]
+    fn a_design_can_come_out_as_a_solid_body() {
+        let mut s = wall_and_shelf();
+        let reply = s.execute("generative.design", &design(json!({"solid": true}))).unwrap();
+        assert!(reply.get("warning").is_none_or(serde_json::Value::is_null), "{reply}");
+        let st = s.model.state();
+        let body = st.bodies.iter().find(|b| b.name == "Generative").expect("the new body");
+        assert!(!body.body.is_mesh(), "a solid body");
     }
 
     /// A moment and a pressure are loads as a force is, a face may slide on what holds it, and
