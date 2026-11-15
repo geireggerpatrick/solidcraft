@@ -112,13 +112,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             )
         }
         // The shelf, and a small plate beside it that is pushed sideways with half the force:
-        // at the same time (`two`) or as a load case of its own (`cases`).
-        "two" | "cases" => {
+        // at the same time (`two`) or as a load case of its own (`cases`). With `edge`, the
+        // plate is also pushed down on its top face, which meets the first in an edge.
+        "two" | "cases" | "edge" => {
             more.push((
                 vec![quad([60.0, 80.0, 30.0], [80.0, 80.0, 30.0], [80.0, 80.0, 50.0], [60.0, 80.0, 50.0])],
                 [0.0, -0.5 * newtons, 0.0],
                 usize::from(case == "cases"),
             ));
+            if case == "edge" {
+                more.push((
+                    vec![quad([60.0, 80.0, 50.0], [80.0, 80.0, 50.0], [80.0, 85.0, 50.0], [60.0, 85.0, 50.0])],
+                    [0.0, 0.0, -0.2 * newtons],
+                    0,
+                ));
+            }
             (
                 vec![quad([5.0, 0.0, 0.0], [5.0, 60.0, 0.0], [5.0, 60.0, 80.0], [5.0, 0.0, 80.0])],
                 vec![quad([30.0, 5.0, 80.0], [30.0, 55.0, 80.0], [100.0, 55.0, 80.0], [100.0, 5.0, 80.0])],

@@ -2319,8 +2319,71 @@ fn lattice(p: &Problem, s: &Settings, brick: &Brick, time_left: &mut dyn FnMut()
 /// Exact cuts the surface keeps: hole cylinders (origin, unit axis, radius).
 pub type Cut = (V3, V3, f64);
 
-/// A half-space the surface stays in: a point on its plane and the normal pointing into it.
-pub type HalfSpace = (V3, V3);
+/// A flat face the structure ends on: the surface stays on the side of the face's plane the
+/// normal points to. The plane bounds the structure around the face only (see
+/// [`plane_holds`]): elsewhere the structure may cross it.
+#[derive(Clone, Debug)]
+pub struct HalfSpace {
+    /// A point on the plane.
+    pub point: V3,
+    /// The unit normal, pointing to the side the surface stays on.
+    pub normal: V3,
+    /// The face's triangles. None: the plane bounds the surface everywhere.
+    pub tris: Vec<[V3; 3]>,
+    /// The box around the triangles.
+    lo: V3,
+    hi: V3,
+}
+
+impl HalfSpace {
+    pub fn new(point: V3, normal: V3, tris: &[[V3; 3]]) -> HalfSpace {
+        let mut lo = [f64::INFINITY; 3];
+        let mut hi = [f64::NEG_INFINITY; 3];
+        for p in tris.iter().flatten() {
+            for a in 0..3 {
+                lo[a] = lo[a].min(p[a]);
+                hi[a] = hi[a].max(p[a]);
+            }
+        }
+        HalfSpace { point, normal: unit(normal), tris: tris.to_vec(), lo, hi }
+    }
+
+    /// A plane that bounds the surface everywhere.
+    pub fn everywhere(point: V3, normal: V3) -> HalfSpace {
+        HalfSpace::new(point, normal, &[])
+    }
+
+    /// How far `p` is in front of the plane; behind it, less than zero.
+    pub fn depth(&self, p: V3) -> f64 {
+        dot(sub(p, self.point), self.normal)
+    }
+
+    /// Whether `p` is over or under the face: its foot on the plane is no further than `reach`
+    /// from the face.
+    pub fn over(&self, p: V3, reach: f64) -> bool {
+        // The foot on the face's own plane: `point` may lie a little off it.
+        let Some(on_face) = self.tris.first().map(|t| t[0]) else { return true };
+        let depth = dot(sub(p, on_face), self.normal);
+        let foot = [0, 1, 2].map(|a| p[a] - depth * self.normal[a]);
+        let reach = reach + 1e-9;
+        (0..3).all(|a| foot[a] >= self.lo[a] - reach && foot[a] <= self.hi[a] + reach)
+            && self.tris.iter().any(|t| point_triangle_distance(foot, t) <= reach)
+    }
+}
+
+/// Whether plane `i` bounds the structure at `p`: `p` is over or under the plane's face, no
+/// further than `reach` beside it, and not right in front of another of the faces, where the
+/// structure stands on that face (two faces of one body that meet in an edge).
+pub fn plane_holds(planes: &[HalfSpace], i: usize, p: V3, reach: f64) -> bool {
+    let Some(plane) = planes.get(i) else { return false };
+    plane.over(p, reach)
+        && !planes.iter().enumerate().any(|(j, other)| {
+            let depth = other.depth(p);
+            // Twice as far in front of the other face as beside this one: where this plane
+            // would hold beside its face, the other face's side is left out whole.
+            j != i && !other.tris.is_empty() && depth > 0.0 && depth < 2.0 * reach && other.over(p, 0.0)
+        })
+}
 
 /// Distance from `p` to triangle `t`.
 pub fn point_triangle_distance(p: V3, t: &[V3; 3]) -> f64 {
@@ -2519,8 +2582,11 @@ pub fn surface(g: &Grid, field: &[f64], up: usize, smooth_iters: usize, cuts: &[
                 }
                 if !within.is_empty() {
                     let p = [0, 1, 2].map(|a| g.origin[a] + (f[a] + 0.5) * g.h);
-                    for (point, normal) in within {
-                        v = v.min(dot(sub(p, *point), unit(*normal)) / (2.0 * g.h));
+                    for (i, plane) in within.iter().enumerate() {
+                        let cut = plane.depth(p) / (2.0 * g.h);
+                        if cut < v && plane_holds(within, i, p, 3.0 * g.h) {
+                            v = cut;
+                        }
                     }
                 }
                 if let Some((lo, hi)) = clip {
@@ -2613,11 +2679,11 @@ pub fn surface(g: &Grid, field: &[f64], up: usize, smooth_iters: usize, cuts: &[
             }
         }
     }
-    taubin(&mut mesh, smooth_iters, within, 0.05 * g.h);
+    taubin(&mut mesh, smooth_iters, within, 0.05 * g.h, 3.0 * g.h);
     // The finer the triangles and the more they were smoothed, the further the fairing reaches:
     // about the same distance in mm, and next to nothing for a lattice's thin struts.
     let rounds = (smooth_iters / 6).min(20);
-    fair(&mut mesh, within, 0.05 * g.h, rounds, rounds * 3 / 2);
+    fair(&mut mesh, within, 0.05 * g.h, 3.0 * g.h, rounds, rounds * 3 / 2);
     // Holes back to their exact radius, and nothing outside the design space's box.
     for p in &mut mesh.pos {
         for (o, ax, r) in cuts {
@@ -2637,15 +2703,18 @@ pub fn surface(g: &Grid, field: &[f64], up: usize, smooth_iters: usize, cuts: &[
 }
 
 /// Smoothing in pairs of a step towards the neighbours and a step back, after G. Taubin: it
-/// smooths while it hardly shrinks. A vertex that lies on one of the planes (within `near`) stays
-/// on it: the flat ends of a structure stay flat.
-fn taubin(m: &mut Mesh, iters: usize, planes: &[HalfSpace], near: f64) {
+/// smooths while it hardly shrinks. A vertex that lies on one of the planes (within `near`, and
+/// no further than `reach` beside the plane's face) stays on it: the flat ends of a structure
+/// stay flat.
+fn taubin(m: &mut Mesh, iters: usize, planes: &[HalfSpace], near: f64, reach: f64) {
     let n = m.pos.len();
-    let planes: Vec<HalfSpace> = planes.iter().map(|(p, d)| (*p, unit(*d))).collect();
     let on: Vec<Vec<usize>> = if planes.is_empty() {
         Vec::new()
     } else {
-        m.pos.iter().map(|p| (0..planes.len()).filter(|&i| dot(sub(*p, planes[i].0), planes[i].1).abs() <= near).collect()).collect()
+        m.pos
+            .iter()
+            .map(|p| (0..planes.len()).filter(|&i| planes[i].depth(*p).abs() <= near && plane_holds(planes, i, *p, reach)).collect())
+            .collect()
     };
     let mut adj: Vec<Vec<usize>> = vec![Vec::new(); n];
     for t in &m.tri {
@@ -2678,9 +2747,9 @@ fn taubin(m: &mut Mesh, iters: usize, planes: &[HalfSpace], near: f64) {
                     m.pos[v][a] = old[v][a] + f * (c[a] - old[v][a]);
                 }
                 for &i in on.get(v).map_or(&[][..], |l| l) {
-                    let off = dot(sub(m.pos[v], planes[i].0), planes[i].1);
+                    let off = planes[i].depth(m.pos[v]);
                     for a in 0..3 {
-                        m.pos[v][a] -= off * planes[i].1[a];
+                        m.pos[v][a] -= off * planes[i].normal[a];
                     }
                 }
             }
@@ -2695,11 +2764,13 @@ fn taubin(m: &mut Mesh, iters: usize, planes: &[HalfSpace], near: f64) {
 /// Martin and Langbein, "Fast and effective feature-preserving mesh denoising", 2007). A
 /// triangle in one of the planes keeps its direction, a vertex on a plane stays on it and no
 /// vertex goes beyond one.
-fn fair(m: &mut Mesh, planes: &[HalfSpace], near: f64, rounds: usize, steps: usize) {
+fn fair(m: &mut Mesh, planes: &[HalfSpace], near: f64, reach: f64, rounds: usize, steps: usize) {
     let n = m.pos.len();
-    let planes: Vec<HalfSpace> = planes.iter().map(|(p, d)| (*p, unit(*d))).collect();
+    // The planes that bound each vertex where it is, and those of them it lies on.
+    let bound: Vec<Vec<usize>> =
+        m.pos.iter().map(|p| (0..planes.len()).filter(|&i| planes[i].depth(*p) <= reach && plane_holds(planes, i, *p, reach)).collect()).collect();
     let on: Vec<Vec<usize>> =
-        m.pos.iter().map(|p| (0..planes.len()).filter(|&i| dot(sub(*p, planes[i].0), planes[i].1).abs() <= near).collect()).collect();
+        m.pos.iter().zip(&bound).map(|(p, bound)| bound.iter().copied().filter(|&i| planes[i].depth(*p).abs() <= near).collect()).collect();
     let flat: Vec<bool> = m.tri.iter().map(|t| (0..planes.len()).any(|i| t.iter().all(|&v| on[v].contains(&i)))).collect();
     // Each triangle's direction, and its area as the weight it has at its corners.
     let mut dir = vec![[0.0; 3]; m.tri.len()];
@@ -2758,11 +2829,13 @@ fn fair(m: &mut Mesh, planes: &[HalfSpace], near: f64, rounds: usize, steps: usi
             for a in 0..3 {
                 m.pos[v][a] += step[v][a] / count[v];
             }
-            for (i, (point, normal)) in planes.iter().enumerate() {
-                let off = dot(sub(m.pos[v], *point), *normal);
-                if on[v].contains(&i) || off < 0.0 {
+            // A step takes a vertex a fraction of a cell: one far behind a plane was not put
+            // there by the fairing and stays.
+            for &i in &bound[v] {
+                let off = planes[i].depth(m.pos[v]);
+                if on[v].contains(&i) || (off < 0.0 && off > -10.0 * near) {
                     for a in 0..3 {
-                        m.pos[v][a] -= off * normal[a];
+                        m.pos[v][a] -= off * planes[i].normal[a];
                     }
                 }
             }
@@ -2798,7 +2871,7 @@ mod tests {
         }
         let ripple = |m: &Mesh| m.pos.iter().map(|p| p[2].abs()).sum::<f64>();
         let before = ripple(&m);
-        fair(&mut m, &[([0.0; 3], [1.0, 0.0, 0.0])], 1e-6, 12, 20);
+        fair(&mut m, &[HalfSpace::everywhere([0.0; 3], [1.0, 0.0, 0.0])], 1e-6, 1.0, 12, 20);
         assert!(ripple(&m) < 0.3 * before, "{} of {before}", ripple(&m));
         assert!(m.pos.iter().step_by(n).all(|p| p[0].abs() < 1e-12) && m.pos.iter().all(|p| p[0] > -1e-12));
     }
@@ -2853,6 +2926,22 @@ mod tests {
         let theory = 300.0 * 100f64.powi(3) / (3.0 * 1900.0 * i);
         // Coarse linear bricks are stiffer than theory; within a factor of two is right.
         assert!(chk.deflection > 0.4 * theory && chk.deflection < 1.2 * theory, "{} vs {theory}", chk.deflection);
+    }
+
+    #[test]
+    fn a_plane_holds_around_its_face_and_not_on_a_face_that_meets_it() {
+        // The side and the top of a block 20 wide: the side faces -y at y = 0, the top +z at z = 10.
+        let side = [[[0.0, 0.0, 0.0], [20.0, 0.0, 0.0], [20.0, 0.0, 10.0]], [[0.0, 0.0, 0.0], [20.0, 0.0, 10.0], [0.0, 0.0, 10.0]]];
+        let top = [[[0.0, 0.0, 10.0], [20.0, 0.0, 10.0], [20.0, 5.0, 10.0]], [[0.0, 0.0, 10.0], [20.0, 5.0, 10.0], [0.0, 5.0, 10.0]]];
+        let planes = [HalfSpace::new([0.0, 0.0, 0.0], [0.0, -1.0, 0.0], &side), HalfSpace::new([0.0, 0.0, 10.0], [0.0, 0.0, 1.0], &top)];
+        // Behind the side, in the block: its plane holds. Far beside the face it does not.
+        assert!(plane_holds(&planes, 0, [10.0, 2.0, 5.0], 3.0));
+        assert!(!plane_holds(&planes, 0, [10.0, 2.0, 40.0], 3.0));
+        // Right above the top the side's plane does not hold, though that is behind it and
+        // close beside its face: the structure stands on the top there.
+        assert!(!plane_holds(&planes, 0, [10.0, 2.0, 11.0], 3.0));
+        // A plane without a face holds everywhere.
+        assert!(plane_holds(&[HalfSpace::everywhere([0.0; 3], [1.0, 0.0, 0.0])], 0, [5.0, 900.0, -900.0], 3.0));
     }
 
     #[test]

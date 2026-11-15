@@ -67,9 +67,12 @@ fn unit(a: V3) -> Option<V3> {
     (n > 1e-12).then(|| [a[0] / n, a[1] / n, a[2] / n])
 }
 
+/// A plane: a point on it and its unit normal.
+type Plane = (V3, V3);
+
 /// The plane of a face whose triangles all lie in one, facing one way: a point and the normal.
-pub fn plane_of(tris: &[[V3; 3]]) -> Option<HalfSpace> {
-    let mut plane: Option<HalfSpace> = None;
+pub fn plane_of(tris: &[[V3; 3]]) -> Option<Plane> {
+    let mut plane: Option<Plane> = None;
     for t in tris {
         let Some(n) = unit(cross(sub(t[1], t[0]), sub(t[2], t[0]))) else { continue };
         match plane {
@@ -84,7 +87,7 @@ pub fn plane_of(tris: &[[V3; 3]]) -> Option<HalfSpace> {
 
 /// The pieces of a mesh that reach one of the planes, and the hollows inside: a closed surface
 /// that faces inwards is the wall of a hollow, which a lattice has behind its skin.
-fn standing(mesh: Mesh, planes: &[HalfSpace]) -> Mesh {
+fn standing(mesh: Mesh, planes: &[Plane]) -> Mesh {
     let mut parent: Vec<usize> = (0..mesh.pos.len()).collect();
     fn root(parent: &mut [usize], mut v: usize) -> usize {
         while parent[v] != v {
@@ -131,7 +134,7 @@ fn standing(mesh: Mesh, planes: &[HalfSpace]) -> Mesh {
 
 struct Face<'a> {
     tris: &'a [[V3; 3]],
-    plane: Option<HalfSpace>,
+    plane: Option<Plane>,
 }
 
 fn faces(list: &[FaceTris], flat: bool) -> Vec<Face<'_>> {
@@ -167,7 +170,7 @@ struct Level {
     within: Vec<HalfSpace>,
     /// For each flat picked face its plane and the voxels behind it, which stand for the
     /// face's body.
-    slabs: Vec<(HalfSpace, Vec<usize>)>,
+    slabs: Vec<(Plane, Vec<usize>)>,
     /// The radius of the fillets into those bodies, in voxels.
     round: f64,
 }
@@ -202,6 +205,15 @@ fn extent(study: &Study, held: &[Face], load: &[Face]) -> Result<(V3, V3, f64), 
         }
     }
     Ok((lo, hi, (0..3).map(|a| hi[a] - lo[a]).product::<f64>()))
+}
+
+/// Whether `p` is right in front of another flat picked face than face `me`, no further than
+/// `far` from it: the structure stands on that face there.
+fn stands_on_other(planes: &[HalfSpace], me: usize, p: V3, far: f64) -> bool {
+    planes.iter().enumerate().any(|(j, other)| {
+        let depth = other.depth(p);
+        j != me && !other.tris.is_empty() && depth > 0.0 && depth < far && other.over(p, 0.0)
+    })
 }
 
 /// The study's problem on a grid of about `voxels` cells, for members `wall` mm thick. With
@@ -247,7 +259,21 @@ fn level(
                     grid.inside[v] = false;
                 }
             }
-            let within = held.iter().chain(load).filter_map(|f| f.plane).map(|(pt, n)| ([0, 1, 2].map(|a| pt[a] - OVERLAP * n[a]), n)).collect();
+            // A flat picked face's plane bounds the structure everywhere, unless another picked
+            // face lies behind it (two faces of one body that meet in an edge, a face in the
+            // middle of the others): then it bounds the structure around its face only, or
+            // it would shut that other face out.
+            let within = held
+                .iter()
+                .chain(load)
+                .filter_map(|f| {
+                    let (pt, n) = f.plane?;
+                    let behind = |p: &V3| dot(sub(*p, pt), n) < -1e-3;
+                    let shuts_out = held.iter().chain(load).any(|g| !std::ptr::eq(f, g) && g.tris.iter().flatten().any(behind));
+                    let at = [0, 1, 2].map(|a| pt[a] - OVERLAP * n[a]);
+                    Some(if shuts_out { HalfSpace::new(at, n, f.tris) } else { HalfSpace::everywhere(at, n) })
+                })
+                .collect();
             (grid, None, within)
         }
     };
@@ -280,13 +306,19 @@ fn level(
             }
         }
     }
-    let mut slabs: Vec<(HalfSpace, Vec<usize>)> = Vec::new();
+    let mut slabs: Vec<(Plane, Vec<usize>)> = Vec::new();
     let mut cover = vec![false; grid.len()];
+    // How far beside a flat picked face its plane bounds the structure: two cells further than
+    // the fillet around the face.
+    let beside_to = (round + 2.0) * h;
     if boxed {
-        // Nothing is built on the far side of a picked face's plane.
-        for (point, normal) in &within {
+        // Nothing is built on the far side of a picked face's plane. Where the plane bounds the
+        // structure around its face only, that is behind the face and beside it as far as the
+        // fillet around the face reaches; further away the structure may cross the plane.
+        for (i, plane) in within.iter().enumerate() {
             for v in 0..grid.len() {
-                if dot(sub(grid.center(v), *point), *normal) < -0.9 * h {
+                let c = grid.center(v);
+                if grid.inside[v] && plane.depth(c) < -0.9 * h && gv::plane_holds(&within, i, c, beside_to) {
                     grid.inside[v] = false;
                 }
             }
@@ -310,6 +342,7 @@ fn level(
             let cover_to = if small { h.max(0.6 * wall) } else { 0.0 };
             let mut behind = Vec::new();
             let mut front = Vec::new();
+            let everywhere = within.get(slabs.len()).is_none_or(|plane| plane.tris.is_empty());
             // A face narrower than a cell still gets the cells along it.
             for reach in [0.3 * h, 0.9 * h] {
                 behind.clear();
@@ -323,7 +356,11 @@ fn level(
                     let foot = [0, 1, 2].map(|a| c[a] - depth * normal[a]);
                     let aside = f.tris.iter().map(|t| gv::point_triangle_distance(foot, t)).fold(f64::MAX, f64::min);
                     if aside <= reach && depth < 0.0 {
-                        behind.push(v);
+                        // Not where the structure stands on another face that meets this one
+                        // in an edge: there the cells belong to that face's side.
+                        if !stands_on_other(&within, slabs.len(), c, 2.0 * beside_to) {
+                            behind.push(v);
+                        }
                     } else if aside <= reach && !(inset > 0.0 && outline.iter().any(|[a, b]| segment_distance(foot, *a, *b) < inset)) {
                         if depth < 1.25 * h {
                             on_face[v] = true;
@@ -331,7 +368,11 @@ fn level(
                         if depth < cover_to {
                             front.push(v);
                         }
-                    } else if depth > -0.9 * h && depth < 1.25 * h {
+                    } else if depth > -0.9 * h
+                        && depth < 1.25 * h
+                        && (everywhere || aside <= beside_to)
+                        && !stands_on_other(&within, slabs.len(), c, 2.0 * beside_to)
+                    {
                         beside[v] = true;
                     }
                 }
@@ -525,7 +566,7 @@ pub fn run(study: &Study, time_left: &mut dyn FnMut() -> bool) -> Result<Report,
     }
     let mesh = gv::surface(g, &field, up, if lattice { 4 * up * up } else { 15 * up * up }, &[], clip, &within);
     // Loose crumbs carry nothing: only pieces that stand on a held face stay.
-    let held_planes: Vec<HalfSpace> = held.iter().filter_map(|f| f.plane).collect();
+    let held_planes: Vec<Plane> = held.iter().filter_map(|f| f.plane).collect();
     let mesh = if held_planes.len() == held.len() { standing(mesh, &held_planes) } else { mesh };
     if mesh.tri.is_empty() {
         return Err("no structure came out; the faces may be too far apart for this margin".into());

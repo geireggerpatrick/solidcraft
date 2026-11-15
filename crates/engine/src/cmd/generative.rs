@@ -340,6 +340,24 @@ mod tests {
         }
     }
 
+    /// Two faces of one body that meet in an edge: neither face's plane shuts the other face
+    /// out, and a structure that carries both comes out.
+    #[test]
+    fn two_faces_of_a_body_that_meet_in_an_edge_are_both_loaded() {
+        let mut s = wall_and_shelf();
+        let rail = json!({"length": 40, "width": 4, "height": 10, "corner": [20, 36, 20], "operation": "new", "body_name": "Rail"});
+        s.execute("solid.box", &rail).unwrap();
+        let loads = json!([
+            {"faces": [{"body": "Rail", "point": [40, 36, 25]}], "force": [0, 30, 0]},
+            {"faces": [{"body": "Rail", "point": [40, 38, 30]}], "force": [0, 0, -20]},
+        ]);
+        let reply = s.execute("generative.design", &design(json!({"loads": loads, "voxels": 6000}))).unwrap();
+        assert!(reply["design"]["stress"].as_f64().is_some_and(|stress| stress > 0.0), "{reply}");
+        let st = s.model.state();
+        let body = st.bodies.iter().find(|b| b.name == "Generative").expect("the new body");
+        assert!(body.body.is_closed_mesh());
+    }
+
     /// Normals that waver from corner to corner of a flat stretch come out alike, and the two
     /// sides of a crease keep their own.
     #[test]
