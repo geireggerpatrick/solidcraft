@@ -718,6 +718,7 @@ fn scene_key(app: &SolveApp) -> u64 {
     base_scene_key(app).hash(&mut h);
     lod_generation(app).hash(&mut h);
     app.viewport.mesh_lods.generation().hash(&mut h);
+    app.session.analysis.is_some().hash(&mut h);
     h.finish()
 }
 
@@ -1591,6 +1592,9 @@ struct Instances {
     by_mesh: std::collections::HashMap<(usize, crate::gpu::InstanceLook), usize>,
     kept: InstancedTris,
     lods: crate::mesh_lod::MeshLods,
+    /// Every mesh is drawn in full: a surface analysis (zebra stripes, curvature) shows what
+    /// the surface is like, which a coarser copy within a pixel of it does not tell.
+    full: bool,
 }
 
 impl Instances {
@@ -1617,7 +1621,8 @@ impl Instances {
                 })
                 .collect();
         }
-        Instances { candidates, meshes: Vec::new(), by_mesh: std::collections::HashMap::new(), kept, lods: app.viewport.mesh_lods.clone() }
+        let full = app.session.analysis.is_some();
+        Instances { candidates, meshes: Vec::new(), by_mesh: std::collections::HashMap::new(), kept, lods: app.viewport.mesh_lods.clone(), full }
     }
 
     /// Draw `b` as an instance when it is one, in colour `col` (its alpha for a see-through
@@ -1649,7 +1654,7 @@ impl Instances {
                             None => taken_shared_tris(&mesh).unwrap_or_else(|| std::sync::Arc::new(crate::gpu::SharedTris::new(&mesh))),
                         },
                         // Keep the existing detail of newly instanced single reference meshes.
-                        if lod_eligible { self.lods.levels(&mesh).map(|l| l.as_ref().clone()).unwrap_or_default() } else { Vec::new() },
+                        if lod_eligible && !self.full { self.lods.levels(&mesh).map(|l| l.as_ref().clone()).unwrap_or_default() } else { Vec::new() },
                     ),
                 };
                 self.meshes.push((

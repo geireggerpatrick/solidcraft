@@ -466,8 +466,8 @@ fn control_role(command: &str, label: &str) -> Option<egui::accesskit::Role> {
     Some(match label {
         "Type" if matches!(command, "sheet.flange" | "sheet.hem" | "solid.revolve" | "solid.emboss" | "solid.scale") => return None,
         "Direction" | "Second direction" => return None, // segmented buttons, labelled by each choice
-        "Style" | "Detail" | "Goal" | "Second load acts" if command == "generative.design" => return None,
-        "Material" | "Mirror" | "Manufacturing" if command == "generative.design" => Role::ComboBox,
+        "Style" | "Detail" | "Goal" | "Load type" if command == "generative.design" => return None,
+        "Material" | "Mirror" | "Manufacturing" | "Load case" if command == "generative.design" => Role::ComboBox,
         "ui.fair_strength" | "ui.fair_iterations" => return None,
         "Size" if matches!(command, "solid.cylinder" | "solid.sphere") => return None, // Diameter | Radius
         "Continuity" | "Corners" | "Cells" | "Profile" => return None,
@@ -647,12 +647,11 @@ form_case!(
     generative_design,
     "generative.design",
     [
+        "Load type",
         "Force (N)",
         "Direction",
         "Direction (x, y, z)",
-        "Second force (N)",
-        "Second direction",
-        "Second load acts",
+        "Load case",
         "Style",
         "Detail",
         "Material",

@@ -75,6 +75,7 @@ mod font_literals_tests;
 pub mod fonts;
 pub use solidcraft_ui_kit::frame;
 pub mod frame_rate;
+mod generative_preview;
 pub mod gizmo;
 pub mod gpu;
 pub mod help;

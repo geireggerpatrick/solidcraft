@@ -260,22 +260,14 @@ crate::dialog_descriptor::dialog_descriptors! {
             MeshConvert {
                 tolerance: String,
             },
-            /// A light structure grown between held and loaded faces. `direction` indexes
-            /// [`super::GENERATIVE_DIRECTIONS`] unless `vector` gives the force's direction,
-            /// `style` the engine's styles, `detail` the cell counts of
+            /// A light structure grown between held and loaded faces. Each of `loads` acts on
+            /// the faces of its own input ([`super::generative_load_input`]); `style` indexes
+            /// the engine's styles, `detail` the cell counts of
             /// [`super::GENERATIVE_DETAIL`] and `material` [`super::GENERATIVE_MATERIALS`], which
             /// fills `strength` and `modulus`. Empty `wall`, `deflection` and `margin` leave the
             /// engine's defaults.
             Generative {
-                force: String,
-                direction: usize,
-                vector: String,
-                /// The force on the further loaded faces (empty: as much as `force`) and its
-                /// direction, as `direction`.
-                force2: String,
-                direction2: usize,
-                /// Whether the second load acts on its own (1) or together with the first (0).
-                apart: usize,
+                loads: Vec<crate::dialogs::GenerativeLoad>,
                 style: usize,
                 detail: usize,
                 material: usize,
@@ -732,6 +724,7 @@ fn generative_summary(reply: &Value) -> Option<String> {
         &[
             ("solver", design.get("solver")?.as_str()?),
             ("seconds", &number("seconds", 0)?),
+            ("share", &format!("{:.0}", 100.0 * design.get("solving")?.as_f64()? / design.get("seconds")?.as_f64()?.max(1e-9))),
             ("stress", &number("stress", 1)?),
             ("allowed", &number("allowed", 1)?),
             ("deflection", &number("deflection", 2)?),
@@ -1078,12 +1071,7 @@ impl Dialog {
             ),
             "generative.design" => Dialog::new(
                 Kind::Generative {
-                    force: "100".into(),
-                    direction: 5,
-                    vector: String::new(),
-                    force2: String::new(),
-                    direction2: 5,
-                    apart: 0,
+                    loads: vec![GenerativeLoad::new("100")],
                     style: 0,
                     detail: 1,
                     material: 1,
@@ -1100,13 +1088,18 @@ impl Dialog {
                     clearance: String::new(),
                     time: String::new(),
                 },
-                vec![
+                // The faces of the second load and the ones after it follow, shown as loads are added.
+                [
                     SelInput::new("Held faces", FACES, true),
                     SelInput::new("Loaded faces", FACES, true),
                     SelInput::new("Bodies to avoid", BODIES, true),
                     SelInput::new("Design space", BODIES, false),
-                    SelInput::new("More loaded faces", FACES, true),
-                ],
+                    SelInput::new("Sliding faces", FACES, true),
+                    SelInput::new("Pin faces", FACES, true),
+                ]
+                .into_iter()
+                .chain((1..GENERATIVE_LOADS).map(|_| SelInput::new("Loaded faces", FACES, true)))
+                .collect(),
             ),
             // Plane, Axis and Point open as the method their picks call for (`dialogs_auto`).
             _ if solidcraft_engine::cmd::is_construct_tool(id) => return auto::start(app, id),
@@ -4633,10 +4626,64 @@ pub(crate) const GENERATIVE_DIRECTIONS: [(&str, [f64; 3]); 6] = [
     ("+Z", [0.0, 0.0, 1.0]),
     ("-Z", [0.0, 0.0, -1.0]),
 ];
+/// One load of the Generative Design window: what acts on the faces picked for it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct GenerativeLoad {
+    /// Indexes [`GENERATIVE_LOAD_KINDS`]: a force, a moment or a pressure.
+    pub kind: usize,
+    /// How much: newtons, newton metres or MPa.
+    pub amount: String,
+    /// Indexes [`GENERATIVE_DIRECTIONS`] unless `vector` gives the direction: the way a force
+    /// points, or the axis a moment turns about.
+    pub direction: usize,
+    pub vector: String,
+    /// The load case, counted from 0: the loads of one case act together.
+    pub case: usize,
+}
+
+impl GenerativeLoad {
+    pub(crate) fn new(amount: &str) -> Self {
+        Self { kind: 0, amount: amount.into(), direction: 5, vector: String::new(), case: 0 }
+    }
+
+    /// The direction as a unit vector: the three numbers typed win over the axis chosen.
+    /// `None` when what is typed is not three numbers.
+    pub(crate) fn way(&self) -> Option<[f64; 3]> {
+        let vector = self.vector.trim();
+        if vector.is_empty() {
+            return Some(GENERATIVE_DIRECTIONS.get(self.direction).map_or([0.0, 0.0, -1.0], |(_, v)| *v));
+        }
+        let parts: Vec<f64> = if vector.contains(';') {
+            vector.split(';').filter_map(|c| c.trim().replace(',', ".").parse().ok()).collect()
+        } else {
+            vector.split(|c: char| c == ',' || c.is_whitespace()).filter(|c| !c.is_empty()).filter_map(|c| c.parse().ok()).collect()
+        };
+        let length = parts.iter().map(|c| c * c).sum::<f64>().sqrt();
+        (parts.len() == 3 && length.is_finite() && length > 1e-9).then(|| [parts[0] / length, parts[1] / length, parts[2] / length])
+    }
+}
+
+/// The kinds of load: the label, the label of how much, the command's key and what to ask for.
+pub(crate) const GENERATIVE_LOAD_KINDS: [(&str, &str, &str, &str); 3] = [
+    ("Force", "Force (N)", "force", "the force in newtons"),
+    ("Moment", "Moment (Nm)", "moment", "the moment in newton metres"),
+    ("Pressure", "Pressure (MPa)", "pressure", "the pressure in MPa"),
+];
+/// The most loads the Generative Design window takes.
+pub(crate) const GENERATIVE_LOADS: usize = 8;
+pub(crate) const GENERATIVE_LOAD_TITLES: [&str; GENERATIVE_LOADS] = ["Load 1", "Load 2", "Load 3", "Load 4", "Load 5", "Load 6", "Load 7", "Load 8"];
+pub(crate) const GENERATIVE_LOAD_CASES: [&str; 8] = ["1", "2", "3", "4", "5", "6", "7", "8"];
+
+/// The selection input with the faces of load `i` (from 0).
+pub(crate) fn generative_load_input(i: usize) -> usize {
+    if i == 0 { 1 } else { 5 + i }
+}
+
 /// A generative design's styles: the label and the engine's name.
 pub(crate) const GENERATIVE_STYLES: [(&str, &str); 3] = [("Organic", "organic"), ("Tree", "tree"), ("Lattice", "lattice")];
 /// A generative design's levels of detail: the label and the cells to compute with.
-pub(crate) const GENERATIVE_DETAIL: [(&str, f64); 4] = [("Coarse", 40_000.0), ("Medium", 120_000.0), ("Fine", 400_000.0), ("Very fine", 1_200_000.0)];
+pub(crate) const GENERATIVE_DETAIL: [(&str, f64); 4] =
+    [("Coarse", 160_000.0), ("Medium", 480_000.0), ("Fine", 1_200_000.0), ("Very fine", 2_000_000.0)];
 /// The planes a generative design can be mirrored in: the label and the engine's axes.
 pub(crate) const GENERATIVE_MIRRORS: [(&str, &str); 8] =
     [("None", ""), ("X", "x"), ("Y", "y"), ("Z", "z"), ("X and Y", "xy"), ("X and Z", "xz"), ("Y and Z", "yz"), ("X, Y and Z", "xyz")];
@@ -5752,7 +5799,7 @@ pub(crate) fn emboss_profile_plane(app: &SolveApp, sketch: u64) -> Result<Option
 }
 
 /// The commands (id, parameters) a dialog's OK runs.
-fn dialog_commands(app: &SolveApp, d: &Dialog) -> Result<Vec<(String, Value)>, String> {
+pub(crate) fn dialog_commands(app: &SolveApp, d: &Dialog) -> Result<Vec<(String, Value)>, String> {
     let s = &app.session;
     let need = |i: usize, what: &str| -> Result<(), String> { if sels(d, i).is_empty() { Err(format!("select {what} first")) } else { Ok(()) } };
     let profiles = || -> (Value, Value) {
@@ -6139,12 +6186,7 @@ fn dialog_commands(app: &SolveApp, d: &Dialog) -> Result<Vec<(String, Value)>, S
             }
         }
         Kind::Generative {
-            force,
-            direction,
-            vector,
-            force2,
-            direction2,
-            apart,
+            loads,
             style,
             detail,
             strength,
@@ -6161,7 +6203,9 @@ fn dialog_commands(app: &SolveApp, d: &Dialog) -> Result<Vec<(String, Value)>, S
             time,
             ..
         } => {
-            need(0, "the held faces")?;
+            if [0, 4, 5].iter().all(|i| sels(d, *i).is_empty()) {
+                return Err("pick the held faces".into());
+            }
             need(1, "the loaded faces")?;
             // A number as typed, with a decimal comma or point; an empty field is none.
             let number = |text: &str, what: &str| -> Result<Option<f64>, String> {
@@ -6176,34 +6220,34 @@ fn dialog_commands(app: &SolveApp, d: &Dialog) -> Result<Vec<(String, Value)>, S
                     .map(Some)
                     .ok_or_else(|| format!("give {what} as a number above zero"))
             };
-            let newtons = number(force, "the force in newtons")?.ok_or("give the force in newtons")?;
             let faces = |i: usize| -> Vec<Value> {
                 sels(d, i)
                     .iter()
                     .filter_map(|x| if let Sel::Face { body, point, .. } = x { Some(json!({"body": body, "point": pt(*point)})) } else { None })
                     .collect()
             };
-            // The direction typed as three numbers wins over the axis chosen.
-            let axis = if vector.trim().is_empty() {
-                GENERATIVE_DIRECTIONS.get(*direction).map_or([0.0, 0.0, -1.0], |(_, v)| *v)
-            } else {
-                let parts: Vec<f64> = if vector.contains(';') {
-                    vector.split(';').filter_map(|c| c.trim().replace(',', ".").parse().ok()).collect()
-                } else {
-                    vector.split(|c: char| c == ',' || c.is_whitespace()).filter(|c| !c.is_empty()).filter_map(|c| c.parse().ok()).collect()
-                };
-                let length = parts.iter().map(|c| c * c).sum::<f64>().sqrt();
-                if parts.len() != 3 || !(length.is_finite() && length > 1e-9) {
-                    return Err("give the direction as three numbers: x, y, z".into());
+            // Each load that has faces: the faces, the command's key, its value and the load
+            // case. A force points and a moment turns about the direction; a pressure has none.
+            let mut acting: Vec<(Vec<Value>, &str, Value, usize)> = Vec::new();
+            for (i, load) in loads.iter().enumerate() {
+                let on = faces(generative_load_input(i));
+                if on.is_empty() {
+                    continue;
                 }
-                [parts[0] / length, parts[1] / length, parts[2] / length]
-            };
+                let (_, _, key, what) = GENERATIVE_LOAD_KINDS.get(load.kind).copied().unwrap_or(GENERATIVE_LOAD_KINDS[0]);
+                let amount = number(&load.amount, what)?.ok_or_else(|| format!("give {what}"))?;
+                let value = if key == "pressure" {
+                    json!(amount)
+                } else {
+                    let way = load.way().ok_or("give the direction as three numbers: x, y, z")?;
+                    json!(way.map(|c| c * amount))
+                };
+                acting.push((on, key, value, load.case.min(7)));
+            }
             let mut params = json!({
                 "held": faces(0),
-                "load": faces(1),
-                "force": axis.map(|c| c * newtons),
                 "style": GENERATIVE_STYLES.get(*style).map_or("organic", |(_, id)| *id),
-                "voxels": GENERATIVE_DETAIL.get(*detail).map_or(120_000.0, |(_, n)| *n),
+                "voxels": GENERATIVE_DETAIL.get(*detail).map_or(480_000.0, |(_, n)| *n),
             });
             let bodies = |i: usize| -> Vec<String> {
                 sels(d, i).iter().filter_map(|x| if let Sel::Body { name } = x { Some(name.clone()) } else { None }).collect()
@@ -6244,14 +6288,27 @@ fn dialog_commands(app: &SolveApp, d: &Dialog) -> Result<Vec<(String, Value)>, S
                 if let Some(space) = bodies(3).into_iter().next() {
                     o.insert("space".into(), json!(space));
                 }
-                // Further faces with a force of their own, acting at the same time as the first
-                // or as a load case of its own.
-                let further = faces(4);
+                for (key, i) in [("slide", 4), ("pin", 5)] {
+                    let guided = faces(i);
+                    if !guided.is_empty() {
+                        o.insert(key.into(), json!(guided));
+                    }
+                }
+                // The first load, in load case 1, is the command's `load`; the others, each with
+                // its load case, are its `loads`.
+                let mut further = Vec::new();
+                for (n, (on, key, value, case)) in acting.into_iter().enumerate() {
+                    if n == 0 && case == 0 {
+                        o.insert("load".into(), json!(on));
+                        o.insert(key.into(), value);
+                    } else {
+                        let mut load = json!({"faces": on, "case": case + 1});
+                        load[key] = value;
+                        further.push(load);
+                    }
+                }
                 if !further.is_empty() {
-                    // With no second force typed, they carry as much as the loaded faces.
-                    let second = number(force2, "the second force in newtons")?.unwrap_or(newtons);
-                    let way = GENERATIVE_DIRECTIONS.get(*direction2).map_or([0.0, 0.0, -1.0], |(_, v)| *v);
-                    o.insert("loads".into(), json!([{"faces": further, "force": way.map(|c| c * second), "case": 1 + (*apart).min(1)}]));
+                    o.insert("loads".into(), json!(further));
                 }
             }
             ("generative.design", params)

@@ -480,6 +480,27 @@ pub trait GridSolver: Send {
 
 static GRID_SOLVER: std::sync::Mutex<Option<Box<dyn GridSolver>>> = std::sync::Mutex::new(None);
 
+/// The clock a program lends to measure how long the equations take: seconds since some start.
+static CLOCK: std::sync::Mutex<Option<fn() -> f64>> = std::sync::Mutex::new(None);
+/// Microseconds spent solving equations since the last [`take_solve_seconds`].
+static SOLVING: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Installs the clock that times the equation solver; this crate has none of its own.
+pub fn set_clock(clock: fn() -> f64) {
+    if let Ok(mut slot) = CLOCK.lock() {
+        *slot = Some(clock);
+    }
+}
+
+fn now() -> Option<f64> {
+    CLOCK.lock().ok().and_then(|slot| *slot).map(|clock| clock())
+}
+
+/// The seconds spent solving equations since this was last asked, with a clock installed.
+pub fn take_solve_seconds() -> f64 {
+    SOLVING.swap(0, std::sync::atomic::Ordering::Relaxed) as f64 * 1e-6
+}
+
 /// Installs (or with `None` removes) the solver that designs with [`Settings::accelerate`] set
 /// use for their linear problems. Without one, or when it fails, the built-in solver computes.
 pub fn set_grid_solver(solver: Option<Box<dyn GridSolver>>) {
@@ -523,6 +544,8 @@ struct Fem<'a> {
     dofs: Vec<[u32; 24]>,
     ndof: usize,
     fixed: Vec<bool>,
+    /// The nodes that are held by a spring, in some directions only.
+    springs: Vec<(u32, Spring)>,
     /// The forces on the nodes in each load case; the first is the case of the main force.
     forces: Vec<Vec<f64>>,
     /// The built-in solver's levels, built when it first solves.
@@ -536,17 +559,10 @@ impl<'a> Fem<'a> {
     /// `elems`: the voxels in the model; `fixed`/`load`: voxels whose nodes are held / loaded.
     /// `more`: further forces, each on its own voxels among the loaded ones and with its load
     /// case: 0 acts together with `f`, forces with the same other number act together in a case
-    /// of their own.
-    fn new(
-        g: &'a Grid,
-        brick: &'a Brick,
-        elems: Vec<usize>,
-        fixed: &[bool],
-        load: &[bool],
-        f: V3,
-        more: &[(Vec<bool>, V3, usize)],
-        accelerate: bool,
-    ) -> Fem<'a> {
+    /// of their own. `p.fields` are forces on single voxels, `p.springs` the voxels among the
+    /// held ones that are held in some directions only.
+    fn new(g: &'a Grid, brick: &'a Brick, elems: Vec<usize>, p: &Problem, accelerate: bool) -> Fem<'a> {
+        let (fixed, load, f, more) = (&p.fixed, &p.load, p.force, &p.more);
         let nn = (g.n[0] + 1) * (g.n[1] + 1) * (g.n[2] + 1);
         let node = |i: usize, j: usize, k: usize| i + (g.n[0] + 1) * (j + (g.n[1] + 1) * k);
         let corners = |v: usize| -> [usize; 8] {
@@ -586,17 +602,52 @@ impl<'a> Fem<'a> {
                 d
             })
             .collect();
+        // A voxel on a spring: its nodes move in the directions the spring leaves free, unless
+        // a voxel that is held outright shares them.
+        let mut sprung: Vec<Option<Spring>> = vec![None; g.len()];
+        for (v, spring) in &p.springs {
+            if let Some(slot) = sprung.get_mut(*v) {
+                *slot = Some(*spring);
+            }
+        }
         let mut fixed_dof = vec![false; ndof];
         for (e, &v) in elems.iter().enumerate() {
-            if fixed[v] {
+            if fixed[v] && sprung[v].is_none() {
                 for d in dofs[e] {
                     fixed_dof[d as usize] = true;
                 }
             }
         }
+        // A node between several sprung voxels gets the mean of their springs.
+        let mut at_node: std::collections::BTreeMap<u32, (Spring, f64)> = std::collections::BTreeMap::new();
+        for (e, &v) in elems.iter().enumerate() {
+            let Some(spring) = sprung[v] else { continue };
+            for a in 0..8 {
+                let node = dofs[e][3 * a] / 3;
+                if !fixed_dof[3 * node as usize] {
+                    let (sum, count) = at_node.entry(node).or_insert(([0.0; 6], 0.0));
+                    for x in 0..6 {
+                        sum[x] += spring[x];
+                    }
+                    *count += 1.0;
+                }
+            }
+        }
+        // A little of each spring holds in every direction, so a part that its supports leave
+        // free to slide or turn moves far, and does not make the equations unsolvable.
+        let springs: Vec<(u32, Spring)> = at_node
+            .into_iter()
+            .map(|(node, (sum, count))| {
+                let mut s = sum.map(|c| c / count);
+                for x in 0..3 {
+                    s[x] += 1e-7;
+                }
+                (node, s)
+            })
+            .collect();
         // Each force is shared equally by the free nodes of its voxels; the first one acts on
         // the loaded voxels no further force names.
-        let mut cases: Vec<usize> = more.iter().map(|m| m.2).filter(|&c| c != 0).collect();
+        let mut cases: Vec<usize> = more.iter().map(|m| m.2).chain(p.fields.iter().map(|m| m.1)).filter(|&c| c != 0).collect();
         cases.sort_unstable();
         cases.dedup();
         let mut forces = vec![vec![0.0; ndof]; 1 + cases.len()];
@@ -623,6 +674,25 @@ impl<'a> Fem<'a> {
         for (on, f, case) in more {
             spread(*case, &|v| on.get(v) == Some(&true), *f);
         }
+        // A force on one voxel is shared by its free nodes.
+        let mut model = vec![NONE; g.len()];
+        for (e, &v) in elems.iter().enumerate() {
+            model[v] = e as u32;
+        }
+        for (on, case) in &p.fields {
+            let at = cases.binary_search(case).map_or(0, |i| i + 1);
+            let Some(force) = forces.get_mut(at) else { continue };
+            for (v, f) in on {
+                let Some(&e) = model.get(*v).filter(|e| **e != NONE) else { continue };
+                let free: Vec<usize> = (0..8).map(|a| (dofs[e as usize][3 * a] / 3) as usize).filter(|&n| !fixed_dof[3 * n]).collect();
+                let share = 1.0 / free.len().max(1) as f64;
+                for n in free {
+                    for x in 0..3 {
+                        force[3 * n + x] += f[x] * share;
+                    }
+                }
+            }
+        }
         let coords: Vec<[usize; 3]> = elems.iter().map(|&v| g.ijk(v)).collect();
         let mut grid_node = vec![0u32; count as usize];
         for (n, &m) in map.iter().enumerate() {
@@ -630,12 +700,16 @@ impl<'a> Fem<'a> {
                 grid_node[m as usize] = n as u32;
             }
         }
-        let accelerate = accelerate && grid_solver_name().is_some();
-        Fem { grid_node, accelerate, g, brick, elems, dofs, ndof, fixed: fixed_dof, forces, mg: std::sync::OnceLock::new(), coords }
+        // The installed solver knows nodes that are held or free, and no springs.
+        let accelerate = accelerate && springs.is_empty() && grid_solver_name().is_some();
+        Fem { grid_node, accelerate, g, brick, elems, dofs, ndof, fixed: fixed_dof, springs, forces, mg: std::sync::OnceLock::new(), coords }
     }
 
     fn matvec(&self, stiff: &[f64], x: &[f64], y: &mut [f64]) {
         apply_elements(&self.brick.ke, &self.dofs, stiff, x, y);
+        if !self.springs.is_empty() {
+            apply_springs(&self.springs, spring_stiffness(self.brick, stiff), x, y);
+        }
         for i in 0..self.ndof {
             if self.fixed[i] {
                 y[i] = x[i];
@@ -647,12 +721,15 @@ impl<'a> Fem<'a> {
     /// multigrid V-cycle, starting from `u`. Returns the iterations.
     fn solve(&self, case: usize, stiff: &[f64], u: &mut Vec<f64>, tol: f64, max_iter: usize) -> usize {
         let Some(force) = self.forces.get(case) else { return 0 };
-        if self.accelerate
-            && let Some(iterations) = self.solve_outside(force, stiff, u, tol, max_iter)
-        {
-            return iterations;
+        let began = now();
+        let iterations = match self.accelerate.then(|| self.solve_outside(force, stiff, u, tol, max_iter)).flatten() {
+            Some(iterations) => iterations,
+            None => self.solve_here(force, stiff, u, tol, max_iter),
+        };
+        if let (Some(began), Some(ended)) = (began, now()) {
+            SOLVING.fetch_add((1e6 * (ended - began).max(0.0)) as u64, std::sync::atomic::Ordering::Relaxed);
         }
-        self.solve_here(force, stiff, u, tol, max_iter)
+        iterations
     }
 
     /// Solves with the installed [`GridSolver`], which computes in single precision: the
@@ -721,7 +798,7 @@ impl<'a> Fem<'a> {
     }
 
     fn levels(&self) -> &Multigrid<'a> {
-        self.mg.get_or_init(|| Multigrid::new(self.brick, self.g.n, &self.coords, &self.dofs, self.ndof, &self.fixed))
+        self.mg.get_or_init(|| Multigrid::new(self.brick, self.g.n, &self.coords, &self.dofs, self.ndof, &self.fixed, &self.springs))
     }
 
     fn solve_here(&self, force: &[f64], stiff: &[f64], u: &mut Vec<f64>, tol: f64, max_iter: usize) -> usize {
@@ -846,6 +923,37 @@ struct Level {
     /// For each node of the finer level: the coarse nodes (of this level) and weights that
     /// interpolate it. Empty on the finest level.
     prolong: Vec<Vec<(u32, f64)>>,
+    /// Nodes on springs: the node and its [`Spring`].
+    springs: Vec<(u32, Spring)>,
+}
+
+/// A spring that holds a node in some directions only: the symmetric matrix that takes the
+/// node's displacement to the share of it that is held, as xx, yy, zz, xy, xz, yz.
+pub type Spring = [f64; 6];
+
+/// How stiff a spring is, against a solid cell.
+const SPRING: f64 = 30.0;
+
+/// The spring that holds along the unit vector `n` only.
+pub fn spring_along(n: V3) -> Spring {
+    [n[0] * n[0], n[1] * n[1], n[2] * n[2], n[0] * n[1], n[0] * n[2], n[1] * n[2]]
+}
+
+/// The spring that holds in every direction but along the unit vector `t`.
+pub fn spring_across(t: V3) -> Spring {
+    let along = spring_along(t);
+    [1.0 - along[0], 1.0 - along[1], 1.0 - along[2], -along[3], -along[4], -along[5]]
+}
+
+/// Adds what the springs, each `k` stiff, answer the displacements `x` with to `y`.
+fn apply_springs(springs: &[(u32, Spring)], k: f64, x: &[f64], y: &mut [f64]) {
+    for (node, s) in springs {
+        let i = 3 * *node as usize;
+        let (Some(u), true) = (x.get(i..i + 3), y.len() >= i + 3) else { continue };
+        y[i] += k * (s[0] * u[0] + s[3] * u[1] + s[4] * u[2]);
+        y[i + 1] += k * (s[3] * u[0] + s[1] * u[1] + s[5] * u[2]);
+        y[i + 2] += k * (s[4] * u[0] + s[5] * u[1] + s[2] * u[2]);
+    }
 }
 
 struct Multigrid<'a> {
@@ -857,6 +965,8 @@ struct Prepared<'m, 'a> {
     mg: &'m Multigrid<'a>,
     stiff: Vec<Vec<f64>>,
     inv_diag: Vec<Vec<f64>>,
+    /// How stiff each spring is.
+    spring: f64,
 }
 
 /// Elements per piece of [`apply_elements`]. The pieces, not the threads, fix the order of the
@@ -944,8 +1054,14 @@ fn apply_elements(ke: &[[f64; 24]; 24], dofs: &[[u32; 24]], stiff: &[f64], x: &[
     }
 }
 
-fn level_matvec(brick: &Brick, l: &Level, stiff: &[f64], x: &[f64], y: &mut [f64]) {
+/// How stiff a spring is beside cells of the stiffness `stiff`: [`SPRING`] times the stiffest.
+fn spring_stiffness(brick: &Brick, stiff: &[f64]) -> f64 {
+    SPRING * brick.ke[0][0] * stiff.iter().copied().fold(0.0, f64::max)
+}
+
+fn level_matvec(brick: &Brick, l: &Level, stiff: &[f64], spring: f64, x: &[f64], y: &mut [f64]) {
     apply_elements(&brick.ke, &l.dofs, stiff, x, y);
+    apply_springs(&l.springs, spring, x, y);
     for i in 0..l.ndof {
         if l.fixed[i] {
             y[i] = x[i];
@@ -954,8 +1070,23 @@ fn level_matvec(brick: &Brick, l: &Level, stiff: &[f64], x: &[f64], y: &mut [f64
 }
 
 impl<'a> Multigrid<'a> {
-    fn new(brick: &'a Brick, n0: [usize; 3], coords0: &[[usize; 3]], dofs0: &[[u32; 24]], ndof0: usize, fixed0: &[bool]) -> Multigrid<'a> {
-        let mut levels = vec![Level { dofs: dofs0.to_vec(), ndof: ndof0, fixed: fixed0.to_vec(), children: Vec::new(), prolong: Vec::new() }];
+    fn new(
+        brick: &'a Brick,
+        n0: [usize; 3],
+        coords0: &[[usize; 3]],
+        dofs0: &[[u32; 24]],
+        ndof0: usize,
+        fixed0: &[bool],
+        springs0: &[(u32, Spring)],
+    ) -> Multigrid<'a> {
+        let mut levels = vec![Level {
+            dofs: dofs0.to_vec(),
+            ndof: ndof0,
+            fixed: fixed0.to_vec(),
+            children: Vec::new(),
+            prolong: Vec::new(),
+            springs: springs0.to_vec(),
+        }];
         let mut n = n0;
         let mut coords: Vec<[usize; 3]> = coords0.to_vec();
         // Node grid id -> compact node of the current level.
@@ -1047,7 +1178,18 @@ impl<'a> Multigrid<'a> {
                     }
                 }
             }
-            levels.push(Level { dofs: cdofs, ndof: 3 * count as usize, fixed: cfixed, children, prolong });
+            // A coarse node carries the springs of the fine nodes it stands for.
+            let mut sprung: std::collections::BTreeMap<u32, Spring> = std::collections::BTreeMap::new();
+            for (f, spring) in levels.last().map(|l| &l.springs[..]).unwrap_or_default() {
+                for &(cn, w) in prolong.get(*f as usize).map(|l| &l[..]).unwrap_or_default() {
+                    let sum = sprung.entry(cn).or_insert([0.0; 6]);
+                    for x in 0..6 {
+                        sum[x] += w * spring[x];
+                    }
+                }
+            }
+            let springs = sprung.into_iter().collect();
+            levels.push(Level { dofs: cdofs, ndof: 3 * count as usize, fixed: cfixed, children, prolong, springs });
             n = nc;
             coords = ccoords;
             node_map = cnode;
@@ -1059,6 +1201,7 @@ impl<'a> Multigrid<'a> {
     }
 
     fn prepare(&self, stiff0: &[f64]) -> Prepared<'_, 'a> {
+        let spring = spring_stiffness(self.brick, stiff0);
         let mut stiff = vec![stiff0.to_vec()];
         for l in &self.levels[1..] {
             let fine = stiff.last().cloned().unwrap_or_default();
@@ -1075,10 +1218,17 @@ impl<'a> Multigrid<'a> {
                         d[dd[a] as usize] += s[e] * self.brick.ke[a][a];
                     }
                 }
+                for (node, s) in &l.springs {
+                    for x in 0..3 {
+                        if let Some(d) = d.get_mut(3 * *node as usize + x) {
+                            *d += spring * s[x];
+                        }
+                    }
+                }
                 d.iter().zip(&l.fixed).map(|(v, f)| if *f || *v <= 0.0 { 1.0 } else { 1.0 / v }).collect()
             })
             .collect();
-        Prepared { mg: self, stiff, inv_diag }
+        Prepared { mg: self, stiff, inv_diag, spring }
     }
 }
 
@@ -1087,7 +1237,7 @@ impl Prepared<'_, '_> {
         let lv = &self.mg.levels[l];
         let mut az = vec![0.0; lv.ndof];
         for _ in 0..sweeps {
-            level_matvec(self.mg.brick, lv, &self.stiff[l], z, &mut az);
+            level_matvec(self.mg.brick, lv, &self.stiff[l], self.spring, z, &mut az);
             for i in 0..lv.ndof {
                 z[i] += 0.6 * self.inv_diag[l][i] * (r[i] - az[i]);
                 if lv.fixed[i] {
@@ -1107,7 +1257,7 @@ impl Prepared<'_, '_> {
         }
         self.smooth(l, r, &mut z, 1);
         let mut az = vec![0.0; lv.ndof];
-        level_matvec(self.mg.brick, lv, &self.stiff[l], &z, &mut az);
+        level_matvec(self.mg.brick, lv, &self.stiff[l], self.spring, &z, &mut az);
         let coarse = &self.mg.levels[l + 1];
         let mut rc = vec![0.0; coarse.ndof];
         for (f, list) in coarse.prolong.iter().enumerate() {
@@ -1150,7 +1300,7 @@ impl Prepared<'_, '_> {
             if r.iter().map(|v| v * v).sum::<f64>().sqrt() / bn < 1e-4 {
                 break;
             }
-            level_matvec(self.mg.brick, lv, &self.stiff[l], &p, &mut q);
+            level_matvec(self.mg.brick, lv, &self.stiff[l], self.spring, &p, &mut q);
             let pq: f64 = (0..n).map(|i| p[i] * q[i]).sum();
             if pq.abs() < 1e-300 {
                 break;
@@ -1202,6 +1352,12 @@ pub struct Problem {
     /// acts together with `force`, forces with the same other number act together in a case of
     /// their own, and the structure has to carry every case.
     pub more: Vec<(Vec<bool>, V3, usize)>,
+    /// Forces on single voxels among the loaded ones, in newtons, and their load case: what a
+    /// moment or a pressure comes to. The voxels are also named by a force in `more`, a zero
+    /// one if no other, so the main force leaves them out.
+    pub fields: Vec<(Vec<(usize, V3)>, usize)>,
+    /// Voxels among the held ones that are held by a [`Spring`], in some directions only.
+    pub springs: Vec<(usize, Spring)>,
 }
 
 #[derive(Clone, Debug)]
@@ -1293,7 +1449,7 @@ fn check_binary(p: &Problem, brick: &Brick, mask: &[bool], s: &Settings, u: &mut
         return Check { stress: f64::INFINITY, deflection: f64::INFINITY, connected: false, energy: Vec::new() };
     }
     let elems: Vec<usize> = (0..g.len()).filter(|&v| part[v]).collect();
-    let fem = Fem::new(g, brick, elems, &p.fixed, &p.load, p.force, &p.more, s.accelerate);
+    let fem = Fem::new(g, brick, elems, p, s.accelerate);
     let e = s.material.modulus;
     let stiff = vec![e * g.h; fem.elems.len()];
     // Every load case on its own: the stress and the deflection are the worst of them.
@@ -1707,7 +1863,7 @@ fn organic_from(p: &Problem, s: &Settings, brick: &Brick, time_left: &mut dyn Fn
     let g = &p.grid;
     let elems: Vec<usize> = (0..g.len()).filter(|&v| g.inside[v]).collect();
     let ne = elems.len();
-    let fem = Fem::new(g, brick, elems.clone(), &p.fixed, &p.load, p.force, &p.more, s.accelerate);
+    let fem = Fem::new(g, brick, elems.clone(), p, s.accelerate);
     let e0 = s.material.modulus;
     let emin = e0 * 1e-4;
     let pen = 3.0;
@@ -2016,12 +2172,21 @@ fn organic_from(p: &Problem, s: &Settings, brick: &Brick, time_left: &mut dyn Fn
             (mask, rho, chk, ok) = check(&x, false);
             trace(|| format!("again {step} vf {vf:.3} ok {ok} stress {:.2} defl {:.3} conn {}", chk.stress, chk.deflection, chk.connected));
         }
+        let (joined, stressed) = (chk.connected, chk.stress > allowed);
         if ok || best.is_none() || s.volume.is_some() {
             best = Some((mask, rho, chk, vf, x.clone()));
         }
         if !ok && s.volume.is_none() {
             if step == 0 && start.is_none() {
-                notes.push("The stress is too high even with half the design space filled: more space, a stronger material or less force.".into());
+                // What it failed on: the advice differs.
+                let why = if !joined {
+                    "Half the design space filled does not yet join the held and the loaded faces: more detail or more room around."
+                } else if stressed {
+                    "The stress is too high even with half the design space filled: more space, a stronger material or less force."
+                } else {
+                    "It bends too far even with half the design space filled: more space, a stiffer material or a larger deflection allowed."
+                };
+                notes.push(why.into());
             }
             break;
         }
@@ -2890,7 +3055,18 @@ mod tests {
         lv.iter().for_each(|&v| load[v] = true);
         let both: Vec<bool> = fixed.iter().zip(&load).map(|(a, b)| *a || *b).collect();
         let keep = dilate(&grid, &both, 1.0);
-        Problem { grid, fixed, load, keep, supports: vec![fv], loads: vec![lv], force: [0.0, 0.0, -300.0], more: Vec::new() }
+        Problem {
+            grid,
+            fixed,
+            load,
+            keep,
+            supports: vec![fv],
+            loads: vec![lv],
+            force: [0.0, 0.0, -300.0],
+            more: Vec::new(),
+            fields: Vec::new(),
+            springs: Vec::new(),
+        }
     }
 
     fn settings(style: Style) -> Settings {
@@ -2958,6 +3134,47 @@ mod tests {
         };
         let (together, apart) = (deflection(0), deflection(1));
         assert!(apart > 3.0 * together, "{apart} vs {together}");
+    }
+
+    #[test]
+    fn a_sliding_support_holds_along_its_normal_only() {
+        // The bar pushed along its length stands on a sliding end as on a held one; pushed
+        // across, the sliding end gives way.
+        let mut p = problem(5.0);
+        let s = settings(Style::Organic);
+        let brick = Brick::new();
+        let held: Vec<usize> = (0..p.grid.len()).filter(|&v| p.fixed[v]).collect();
+        let mut deflection = |force: V3, slides: bool| {
+            p.force = force;
+            p.springs = if slides { held.iter().map(|&v| (v, spring_along([1.0, 0.0, 0.0]))).collect() } else { Vec::new() };
+            check_binary(&p, &brick, &p.grid.inside.clone(), &s, &mut Vec::new()).deflection
+        };
+        let (along_held, along_sliding) = (deflection([-300.0, 0.0, 0.0], false), deflection([-300.0, 0.0, 0.0], true));
+        let (across_held, across_sliding) = (deflection([0.0, 0.0, -300.0], false), deflection([0.0, 0.0, -300.0], true));
+        assert!(along_sliding > 0.5 * along_held && along_sliding < 3.0 * along_held, "{along_sliding} vs {along_held}; {across_sliding} vs {across_held}");
+        assert!(across_sliding > 100.0 * across_held, "{across_sliding} vs {across_held}");
+    }
+
+    #[test]
+    fn forces_on_single_cells_turn_the_end_of_the_bar() {
+        // Pushes around the middle of the end face that add up to no force: the bar twists,
+        // and a push that adds up to a force bends it further.
+        let mut p = problem(5.0);
+        let s = settings(Style::Organic);
+        let brick = Brick::new();
+        let cells: Vec<usize> = (0..p.grid.len()).filter(|&v| p.load[v]).collect();
+        p.force = [0.0; 3];
+        p.more = vec![(p.load.clone(), [0.0; 3], 0)];
+        let around = |v: usize| {
+            let c = p.grid.center(v);
+            [0.0, -(c[2] - 15.0), c[1] - 20.0]
+        };
+        p.fields = vec![(cells.iter().map(|&v| (v, around(v))).collect(), 0)];
+        let twisted = check_binary(&p, &brick, &p.grid.inside.clone(), &s, &mut Vec::new());
+        assert!(twisted.connected && twisted.deflection > 1e-6 && twisted.deflection.is_finite());
+        p.fields = vec![(cells.iter().map(|&v| (v, [0.0, 0.0, -10.0])).collect(), 0)];
+        let bent = check_binary(&p, &brick, &p.grid.inside.clone(), &s, &mut Vec::new());
+        assert!(bent.deflection > twisted.deflection, "{} vs {}", bent.deflection, twisted.deflection);
     }
 
     fn run(style: Style, h: f64) -> Outcome {
@@ -3069,7 +3286,19 @@ mod bench {
         let mut load = none.clone();
         load[g.len() - 1] = true;
         let t = std::time::Instant::now();
-        let fem = Fem::new(&g, &brick, elems, &fixed, &load, [0.0, 0.0, -1.0], &[], false);
+        let problem = Problem {
+            grid: g.clone(),
+            fixed,
+            load,
+            keep: none,
+            supports: Vec::new(),
+            loads: Vec::new(),
+            force: [0.0, 0.0, -1.0],
+            more: Vec::new(),
+            fields: Vec::new(),
+            springs: Vec::new(),
+        };
+        let fem = Fem::new(&g, &brick, elems, &problem, false);
         println!(
             "build {:?} levels {} ndof {:?}",
             t.elapsed(),

@@ -440,6 +440,95 @@ impl SharedTris {
         out
     }
 
+    /// A simplified copy of a smoothly shaded mesh: lit as the round shape it stands for, not
+    /// as its triangles, which are larger than the original's and would show as facets. Each
+    /// corner takes the mean normal of the triangles around its vertex that turn from its own
+    /// by less than the crease angle (`crease_cos`, its cosine), weighted by their areas, so an
+    /// edge of the shape stays an edge.
+    pub fn from_level_smooth(level: &solidcore_tess::simplify::Level, crease_cos: f32) -> SharedTris {
+        let positions: Vec<[f32; 3]> = level.positions.iter().map(|p| p.to_f32()).collect();
+        let n = u32::try_from(positions.len()).unwrap_or(u32::MAX);
+        let triangles: Vec<[u32; 3]> = level.triangles.iter().filter(|t| t.iter().all(|i| *i < n)).copied().collect();
+        // Each triangle's normal, as long as twice its area.
+        let faces: Vec<[f32; 3]> = triangles
+            .iter()
+            .map(|t| {
+                let [a, b, c] = t.map(|i| positions.get(i as usize).copied().unwrap_or_default());
+                let (u, v) = ([b[0] - a[0], b[1] - a[1], b[2] - a[2]], [c[0] - a[0], c[1] - a[1], c[2] - a[2]]);
+                [u[1] * v[2] - u[2] * v[1], u[2] * v[0] - u[0] * v[2], u[0] * v[1] - u[1] * v[0]]
+            })
+            .collect();
+        let unit = |v: [f32; 3]| {
+            let length = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
+            if length > 1e-30 { v.map(|x| x / length) } else { [0.0; 3] }
+        };
+        let units: Vec<[f32; 3]> = faces.iter().map(|f| unit(*f)).collect();
+        // The triangles around each vertex.
+        let mut start = vec![0u32; positions.len() + 1];
+        for i in triangles.iter().flatten() {
+            if let Some(count) = start.get_mut(*i as usize + 1) {
+                *count += 1;
+            }
+        }
+        for i in 1..start.len() {
+            start[i] += start[i - 1];
+        }
+        let mut around = vec![0u32; triangles.len() * 3];
+        let mut next = start.clone();
+        for (t, tri) in triangles.iter().enumerate() {
+            for i in tri {
+                if let Some(at) = next.get_mut(*i as usize) {
+                    if let Some(slot) = around.get_mut(*at as usize) {
+                        *slot = t as u32;
+                    }
+                    *at += 1;
+                }
+            }
+        }
+        let mut out = SharedTris::default();
+        out.indices.reserve_exact(triangles.len() * 3);
+        let bits = |v: [f32; 3]| v.map(|x| (x + 0.0).to_bits());
+        let mut seen: std::collections::HashMap<[u32; 4], u32, std::hash::BuildHasherDefault<WeldHasher>> =
+            std::collections::HashMap::with_capacity_and_hasher(positions.len(), Default::default());
+        let mut lo = [f32::INFINITY; 3];
+        let mut hi = [f32::NEG_INFINITY; 3];
+        for (t, tri) in triangles.iter().enumerate() {
+            let own = units.get(t).copied().unwrap_or_default();
+            for i in tri {
+                let (from, to) = (start.get(*i as usize).copied().unwrap_or(0) as usize, start.get(*i as usize + 1).copied().unwrap_or(0) as usize);
+                let mut sum = [0.0f32; 3];
+                for s in around.get(from..to).unwrap_or_default() {
+                    let other = units.get(*s as usize).copied().unwrap_or_default();
+                    if own[0] * other[0] + own[1] * other[1] + own[2] * other[2] >= crease_cos {
+                        let face = faces.get(*s as usize).copied().unwrap_or_default();
+                        sum = [sum[0] + face[0], sum[1] + face[1], sum[2] + face[2]];
+                    }
+                }
+                let mut normal = unit(sum);
+                if normal == [0.0; 3] {
+                    normal = own;
+                }
+                let p = positions.get(*i as usize).copied().unwrap_or_default();
+                let [a, b, c] = bits(normal);
+                let fresh = u32::try_from(out.vertices.len() / SHARED_SIZE).unwrap_or(u32::MAX);
+                let index = *seen.entry([*i, a, b, c]).or_insert_with(|| {
+                    for v in p.iter().chain(&normal) {
+                        out.vertices.extend_from_slice(&v.to_le_bytes());
+                    }
+                    for k in 0..3 {
+                        lo[k] = lo[k].min(p[k]);
+                        hi[k] = hi[k].max(p[k]);
+                    }
+                    fresh
+                });
+                out.indices.push(index);
+            }
+        }
+        out.vertices.shrink_to_fit();
+        out.bounds = [lo, hi];
+        out
+    }
+
     /// Vertex `i`: position and normal.
     fn vertex(&self, i: u32) -> ([f32; 3], [f32; 3]) {
         let at = i as usize * SHARED_SIZE;

@@ -360,6 +360,12 @@ pub fn show(app: &mut SolveApp, ui: &mut egui::Ui, painter: &egui::Painter, proj
         app.dialog = Some(d);
         return;
     }
+    // Generative Design shows what its settings mean; it has no value to drag.
+    if matches!(d.kind, Kind::Generative { .. }) {
+        crate::generative_preview::overlay(app, painter, proj, &d);
+        app.dialog = Some(d);
+        return;
+    }
     if let Kind::Measure { result, show, labels, .. } = &mut d.kind {
         labels.drawn = Default::default();
         if !ui.input(|i| i.pointer.primary_down()) {

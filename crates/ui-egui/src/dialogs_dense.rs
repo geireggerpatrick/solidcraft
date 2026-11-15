@@ -341,6 +341,65 @@ fn pattern_direction_group(app: &SolveApp, d: &mut Dialog, ui: &mut egui::Ui, in
     .unwrap_or(false)
 }
 
+/// Generative Design's picks: what holds the part, then each load as a group of its own (its
+/// faces, what acts on them and its load case), then the bodies around. Loads are added and
+/// taken away below the last one.
+fn generative_groups(app: &SolveApp, d: &mut Dialog, ui: &mut egui::Ui) -> bool {
+    let names = app.preferences.origin_plane_names;
+    let mut enter = false;
+    input_rows_range(d, ui, &app.session, names, 0..1);
+    input_rows_range(d, ui, &app.session, names, 4..6);
+    let count = if let Kind::Generative { loads, .. } = &d.kind { loads.len().min(GENERATIVE_LOADS) } else { 0 };
+    for (i, title) in GENERATIVE_LOAD_TITLES.iter().enumerate().take(count) {
+        let at = generative_load_input(i);
+        let group = ui_kit::section(ui, *title, title, true, |ui| {
+            let mut enter = false;
+            input_rows_range(d, ui, &app.session, names, at..at + 1);
+            let Kind::Generative { loads, .. } = &mut d.kind else { return false };
+            let Some(load) = loads.get_mut(i) else { return false };
+            form_row(ui, "Load type", |ui| {
+                ui_kit::segmented(ui, &mut load.kind, &GENERATIVE_LOAD_KINDS.map(|kind| kind.0), Default::default());
+            });
+            let amount = GENERATIVE_LOAD_KINDS.get(load.kind).map_or("Force (N)", |kind| kind.1);
+            form_row(ui, amount, |ui| enter |= field(ui, &mut load.amount));
+            // A force points along the direction, a moment turns about it; a pressure acts
+            // square to its faces.
+            if load.kind < 2 {
+                form_row(ui, "Direction", |ui| {
+                    ui_kit::segmented(ui, &mut load.direction, &GENERATIVE_DIRECTIONS.map(|(label, _)| label), Default::default());
+                });
+                enter |= hint_row(ui, "Direction (x, y, z)", &mut load.vector, tr("as chosen above"));
+            }
+            choice_row(ui, "Load case", title, &mut load.case, &GENERATIVE_LOAD_CASES);
+            enter
+        });
+        enter |= group.unwrap_or(false);
+    }
+    let mut removed = None;
+    if let Kind::Generative { loads, .. } = &mut d.kind {
+        ui.horizontal(|ui| {
+            if ui_kit::text_button(ui, tr("Add load"), loads.len() < GENERATIVE_LOADS).clicked() {
+                loads.push(GenerativeLoad::new("100"));
+            }
+            if ui_kit::text_button(ui, tr("Remove last load"), loads.len() > 1).clicked() {
+                loads.pop();
+                removed = Some(generative_load_input(loads.len()));
+            }
+        });
+    }
+    // A load taken away leaves no faces behind, and the pick goes back to the first load.
+    if let Some(at) = removed {
+        if let Some(input) = d.inputs.get_mut(at) {
+            input.items.clear();
+        }
+        if d.active == at {
+            d.active = 1;
+        }
+    }
+    input_rows_range(d, ui, &app.session, names, 2..4);
+    enter
+}
+
 fn fillet_type(extra: &serde_json::Map<String, Value>) -> usize {
     let value = extra.get("type").and_then(Value::as_str).unwrap_or("constant");
     if value == "g2" { 3 } else { FILLET_TYPES.iter().position(|(_, key)| *key == value).unwrap_or(0) }
@@ -418,6 +477,8 @@ pub(super) fn rows(app: &mut SolveApp, ctx: &egui::Context, d: &mut Dialog, ui: 
     if crate::hole_refs::takes(d) {
         // Each reference edge with its distance (#37, #6380).
         enter |= crate::hole_refs::input_rows(d, ui, &app.session, app.preferences.origin_plane_names, app.preferences.length_decimals);
+    } else if matches!(d.kind, Kind::Generative { .. }) {
+        enter |= generative_groups(app, d, ui);
     } else if matches!(d.kind, Kind::PatternRect { .. }) {
         // Each direction's pick shows in its own group, with its quantity and spacing (#9634).
         input_rows_range(d, ui, &app.session, app.preferences.origin_plane_names, 0..1);
@@ -978,12 +1039,7 @@ fn additional_rows(app: &mut SolveApp, d: &mut Dialog, ui: &mut egui::Ui) -> boo
             form_row(ui, "Tolerance", |ui| enter |= field(ui, tolerance));
         }
         Kind::Generative {
-            force,
-            direction,
-            vector,
-            force2,
-            direction2,
-            apart,
+            loads: _,
             style,
             detail,
             material,
@@ -1000,18 +1056,6 @@ fn additional_rows(app: &mut SolveApp, d: &mut Dialog, ui: &mut egui::Ui) -> boo
             clearance,
             time,
         } => {
-            form_row(ui, "Force (N)", |ui| enter |= field(ui, force));
-            form_row(ui, "Direction", |ui| {
-                ui_kit::segmented(ui, direction, &GENERATIVE_DIRECTIONS.map(|(label, _)| label), Default::default());
-            });
-            enter |= hint_row(ui, "Direction (x, y, z)", vector, tr("as chosen above"));
-            enter |= hint_row_positive(ui, "Second force (N)", force2, tr("as chosen above"));
-            form_row(ui, "Second direction", |ui| {
-                ui_kit::segmented(ui, direction2, &GENERATIVE_DIRECTIONS.map(|(label, _)| label), Default::default());
-            });
-            form_row(ui, "Second load acts", |ui| {
-                ui_kit::segmented(ui, apart, &["Together", "On its own"], Default::default());
-            });
             form_row(ui, "Style", |ui| {
                 ui_kit::segmented(ui, style, &GENERATIVE_STYLES.map(|(label, _)| label), Default::default());
             });

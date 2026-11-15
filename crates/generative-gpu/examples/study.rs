@@ -6,7 +6,7 @@
 use std::io::Write;
 
 use solidcraft_generative::Material;
-use solidcraft_generative::study::{Study, run};
+use solidcraft_generative::study::{Action, Study, run};
 use solidcraft_generative::voxel::{Mesh, Settings, Style, V3, box_mesh};
 
 fn quad(a: V3, b: V3, c: V3, d: V3) -> Vec<[V3; 3]> {
@@ -147,8 +147,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let study = Study {
         held,
         load,
-        force,
-        more,
+        slide: Vec::new(),
+        pin: Vec::new(),
+        // STUDY_ACTION=moment turns the loaded faces about x instead of pushing them, with an
+        // arm of 100 mm; STUDY_ACTION=pressure presses on them with the force's worth per 1000 mm2.
+        action: match std::env::var("STUDY_ACTION").as_deref() {
+            Ok("moment") => Action::Moment([100.0 * newtons, 0.0, 0.0]),
+            Ok("pressure") => Action::Pressure(newtons / 1000.0),
+            _ => Action::Force(force),
+        },
+        more: more.into_iter().map(|(faces, force, case)| (faces, Action::Force(force), case)).collect(),
         space: None,
         obstacles,
         avoid: Vec::new(),

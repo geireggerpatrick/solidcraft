@@ -17,14 +17,24 @@ pub struct GenerativeFace {
     pub point: Point3,
 }
 
-/// A further load: faces, the force on them and the load case it belongs to.
+/// A further load: faces, what acts on them (one of `force`, `moment` and `pressure`) and the
+/// load case it belongs to.
 #[derive(Clone, Debug, Deserialize, JsonSchema)]
 #[schemars(deny_unknown_fields)]
 pub struct GenerativeLoad {
-    /// The faces the force acts on. At least one.
+    /// The faces the load acts on. At least one.
     pub faces: Vec<GenerativeFace>,
-    /// The force in newtons, as a vector `[x, y, z]`.
-    pub force: Point3,
+    /// A force in newtons, as a vector `[x, y, z]`, shared evenly by the faces.
+    #[serde(default)]
+    pub force: Option<Point3>,
+    /// A moment in newton metres, as a vector `[x, y, z]`: it turns the faces about that
+    /// vector through their middle, the way a right-handed screw along it turns.
+    #[serde(default)]
+    pub moment: Option<Point3>,
+    /// A pressure in MPa that presses on the faces, against their outward normals; a negative
+    /// one pulls.
+    #[serde(default)]
+    pub pressure: Option<f64>,
     /// The load case, from 1 to 8. Loads of case 1 act at the same time as `load`; the loads of
     /// each other case act together on their own. Default: 1.
     #[serde(default)]
@@ -39,15 +49,35 @@ pub struct GenerativeLoad {
 #[derive(Debug, Deserialize, JsonSchema)]
 #[schemars(deny_unknown_fields)]
 pub struct GenerativeDesignParams {
-    /// The faces that are held (screwed or glued to something that does not move). At least one.
+    /// The faces that are held (screwed or glued to something that does not move). At least
+    /// one of `held`, `slide` and `pin` has a face.
+    #[serde(default)]
     pub held: Vec<GenerativeFace>,
-    /// The faces the force acts on. At least one.
+    /// Faces that rest on something they can slide on: held along their normal only.
+    /// Default: none.
+    #[serde(default)]
+    pub slide: Option<Vec<GenerativeFace>>,
+    /// Round faces a pin goes through, such as the wall of a hole: held across and along the
+    /// pin, free to turn about it. Default: none.
+    #[serde(default)]
+    pub pin: Option<Vec<GenerativeFace>>,
+    /// The faces the first load acts on. Without them, `loads` gives every load.
+    #[serde(default)]
     pub load: Vec<GenerativeFace>,
-    /// The force in newtons, as a vector `[x, y, z]`; 9.81 N carry one kilogram.
-    pub force: Point3,
-    /// Further loads, each with its own faces and force. Those of load case 1 act at the same
-    /// time as `load`; each other case acts on its own, and the structure carries every case.
-    /// At most 8. Default: none.
+    /// The first load as a force in newtons, as a vector `[x, y, z]`; 9.81 N carry one
+    /// kilogram. Give one of `force`, `moment` and `pressure` with `load`.
+    #[serde(default)]
+    pub force: Option<Point3>,
+    /// The first load as a moment in newton metres, as a vector `[x, y, z]`: it turns the
+    /// `load` faces about that vector through their middle.
+    #[serde(default)]
+    pub moment: Option<Point3>,
+    /// The first load as a pressure in MPa on the `load` faces, against their outward normals.
+    #[serde(default)]
+    pub pressure: Option<f64>,
+    /// Further loads, each with its own faces and a force, a moment or a pressure. Those of
+    /// load case 1 act at the same time as `load`; each other case acts on its own, and the
+    /// structure carries every case. At most 8. Default: none.
     #[serde(default)]
     pub loads: Option<Vec<GenerativeLoad>>,
     /// `organic` (default): material only where the force flows. `tree`: branches from the load
@@ -139,6 +169,9 @@ pub struct GenerativeDesignReport {
     pub solver: String,
     /// How long the computation took, in seconds.
     pub seconds: f64,
+    /// How many of those seconds went into solving the equations, which is the part a
+    /// graphics card computes.
+    pub solving: f64,
     /// The cells of the grid the structure was computed on.
     pub cells: u64,
     /// A cell's size in mm.

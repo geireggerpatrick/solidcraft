@@ -92,15 +92,30 @@ impl MeshLods {
     }
 }
 
+/// A smoothly shaded mesh's levels keep an edge where their triangles turn by more than this
+/// (cosine: 60 degrees).
+const CREASE_COS: f32 = 0.5;
+
 /// `mesh`'s levels: a quarter, a sixteenth and a sixty-fourth of its triangles (none under
-/// [`MIN_LEVEL`]).
+/// [`MIN_LEVEL`]). A mesh shaded smoothly (a corner of a triangle has a normal of its own, as a
+/// scan's or a generative design's do) has smoothly shaded levels: lit by their fewer, larger
+/// triangles they would show facets the mesh does not have.
 fn make(mesh: &Mesh) -> Vec<(Arc<SharedTris>, f32)> {
     let n = mesh.triangles.len();
     let targets: Vec<usize> = [4, 16, 64].into_iter().map(|d| n / d).filter(|t| *t >= MIN_LEVEL).collect();
+    let smooth = smoothly_shaded(mesh);
     solidcraft_engine::geom::simplify::levels(&mesh.positions, &mesh.triangles, &targets)
         .iter()
-        .map(|l| (Arc::new(SharedTris::from_level(l)), l.error as f32))
+        .map(|l| (Arc::new(if smooth { SharedTris::from_level_smooth(l, CREASE_COS) } else { SharedTris::from_level(l) }), l.error as f32))
         .collect()
+}
+
+/// Whether a triangle of `mesh` has corners with different normals.
+fn smoothly_shaded(mesh: &Mesh) -> bool {
+    mesh.triangles.iter().any(|t| {
+        let [a, b, c] = t.map(|i| mesh.normals.get(i as usize).copied());
+        a.is_some() && (a != b || b != c)
+    })
 }
 
 #[cfg(test)]

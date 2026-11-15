@@ -63,3 +63,27 @@ fn a_large_meshs_levels_are_made_once_on_a_worker() {
     lods.retain(&HashSet::new());
     assert!(lods.levels(&mesh).is_none(), "made again when asked again");
 }
+
+/// A smoothly shaded mesh has smoothly shaded levels: on a sphere every corner of a level is
+/// lit straight away from the centre (within a degree), where its triangles' own normals are
+/// several degrees off and would show as facets.
+#[test]
+fn a_smooth_meshs_levels_are_shaded_smoothly() {
+    let mut mesh = (*sphere(110)).clone();
+    for (n, p) in mesh.normals.iter_mut().zip(&mesh.positions) {
+        *n = p.normalized().unwrap();
+    }
+    let levels = make(&mesh);
+    assert!(!levels.is_empty());
+    for (tris, _) in &levels {
+        assert!(!tris.flat);
+        let mut worst = 1.0f32;
+        for (p, n) in tris.corners().flatten() {
+            let length = (p[0] * p[0] + p[1] * p[1] + p[2] * p[2]).sqrt();
+            worst = worst.min((p[0] * n[0] + p[1] * n[1] + p[2] * n[2]) / length);
+        }
+        assert!(worst > 2.0f32.to_radians().cos(), "a corner's normal is {} degrees off", worst.acos().to_degrees());
+    }
+    // A mesh of flat triangles keeps flat levels.
+    assert!(make(&sphere(110)).iter().all(|(tris, _)| tris.flat));
+}

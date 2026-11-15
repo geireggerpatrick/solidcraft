@@ -4,12 +4,12 @@ use serde_json::Value;
 use solidcore_record::Vec3;
 use solidcraft_doc::{FeatureKind, MeshData, ModelState};
 use solidcraft_generative::Material;
-use solidcraft_generative::study::{self, Report, Study};
+use solidcraft_generative::study::{self, Action, Report, Study};
 use solidcraft_generative::voxel::{self as gv, Settings, Style, V3};
 
 use super::{CommandSpec, face::face_at_state, features::add_feature};
 use crate::schema::generative::{GenerativeDesignParams, GenerativeDesignReport, GenerativeDesignResult, GenerativeFace};
-use crate::schema::{TypedContract, output_schema_for};
+use crate::schema::{Point3, TypedContract, output_schema_for};
 use crate::{Result, Session, params::bad};
 
 const CMD: &str = "generative.design";
@@ -20,7 +20,7 @@ pub static COMMANDS: &[CommandSpec] = &[
         .icon("import")
         .contract(&DESIGN_CONTRACT)
         .output(output_schema_for::<GenerativeDesignResult>)
-        .params("held: [{body, point: [x,y,z]}] (faces that are held); load: [{body, point: [x,y,z]}] (faces the force acts on); force: [x,y,z] in newtons; loads?: [{faces: [{body, point}], force: [x,y,z], case?: 1…8}] (further loads; those of case 1, the default, act at the same time as `load`, each other case acts on its own and the structure carries every case); style?: organic|tree|lattice (default organic); space?: body to carve the structure out of (default: the box around the picked faces, around the bodies they belong to, which stay as they are); avoid?: [body] (further bodies to stay clear of); clearance?: mm to stay away from them; margin?: mm the design box reaches beyond the faces; strength?: MPa (default 35); modulus?: MPa (default 1900); safety?: 1…20 (default 2); voxels?: 500…2000000 cells (default 40000); wall?: thinnest strut in mm (default: two and a half cells, at least 1.5 % of the design space's longest side); deflection?: the most the loaded faces may move, in mm (default: 1/300 of the design space's longest side); goal?: lightest|stiffest; keep?: percent of the design space to fill for stiffest (default 20); symmetry?: axes to mirror in, such as x or xy; extrude?: x|y|z (one section along that axis); print?: +x|-x|+y|-y|+z|-z (stands without supports when printed that way up); time?: seconds the computation may take (default 900); name?; body_name? (default Generative): a new mesh body that carries the force from the loaded to the held faces with as little material as the strength allows"),
+        .params("held: [{body, point: [x,y,z]}] (faces that are held); slide?: [{body, point}] (faces held along their normal only, which slide in their surface); pin?: [{body, point}] (round faces on a pin: free to turn about it); load: [{body, point: [x,y,z]}] (faces the first load acts on); force: [x,y,z] in newtons, or moment: [x,y,z] in newton metres about the middle of the faces, or pressure: MPa onto the faces; loads?: [{faces: [{body, point}], force | moment | pressure, case?: 1…8}] (further loads; those of case 1, the default, act at the same time as `load`, each other case acts on its own and the structure carries every case); style?: organic|tree|lattice (default organic); space?: body to carve the structure out of (default: the box around the picked faces, around the bodies they belong to, which stay as they are); avoid?: [body] (further bodies to stay clear of); clearance?: mm to stay away from them; margin?: mm the design box reaches beyond the faces; strength?: MPa (default 35); modulus?: MPa (default 1900); safety?: 1…20 (default 2); voxels?: 500…2000000 cells (default 40000); wall?: thinnest strut in mm (default: two and a half cells, at least 1.5 % of the design space's longest side); deflection?: the most the loaded faces may move, in mm (default: 1/300 of the design space's longest side); goal?: lightest|stiffest; keep?: percent of the design space to fill for stiffest (default 20); symmetry?: axes to mirror in, such as x or xy; extrude?: x|y|z (one section along that axis); print?: +x|-x|+y|-y|+z|-z (stands without supports when printed that way up); time?: seconds the computation may take (default 900); name?; body_name? (default Generative): a new mesh body that carries the force from the loaded to the held faces with as little material as the strength allows"),
 ];
 
 fn v3(p: Vec3) -> V3 {
@@ -105,33 +105,72 @@ fn even_normals(triangles: &[u32], normals: &mut [f64], rounds: usize) {
     }
 }
 
+/// Seconds since the first design, for the study to time its equation solver with.
+fn clock() -> f64 {
+    static START: std::sync::OnceLock<web_time::Instant> = std::sync::OnceLock::new();
+    START.get_or_init(web_time::Instant::now).elapsed().as_secs_f64()
+}
+
 fn in_range(v: Option<f64>, default: f64, lo: f64, hi: f64, key: &str) -> Result<f64> {
     let v = v.unwrap_or(default);
     if v.is_finite() && v >= lo && v <= hi { Ok(v) } else { Err(bad(CMD, format!("`{key}` must be from {lo} to {hi}"))) }
 }
 
+/// What a load is: exactly one of a force in newtons, a moment in newton metres and a pressure
+/// in MPa. `key` names the load in the message.
+fn action(force: Option<&Point3>, moment: Option<&Point3>, pressure: Option<f64>, key: &str) -> Result<Action> {
+    let size = |f: V3| f.iter().map(|c| c * c).sum::<f64>().sqrt();
+    match (force, moment, pressure) {
+        (Some(f), None, None) if size(v3(f.0)) > 1e-6 && size(v3(f.0)) < 1e7 => Ok(Action::Force(v3(f.0))),
+        (Some(_), None, None) => Err(bad(CMD, format!("{key}: `force` must be a vector in newtons, not zero"))),
+        // The study counts in newtons and millimetres.
+        (None, Some(m), None) if size(v3(m.0)) > 1e-9 && size(v3(m.0)) < 1e6 => Ok(Action::Moment(v3(m.0).map(|c| 1000.0 * c))),
+        (None, Some(_), None) => Err(bad(CMD, format!("{key}: `moment` must be a vector in newton metres, not zero"))),
+        (None, None, Some(p)) if p.is_finite() && p.abs() > 1e-9 && p.abs() <= 1000.0 => Ok(Action::Pressure(p)),
+        (None, None, Some(_)) => Err(bad(CMD, format!("{key}: `pressure` must be a number in MPa up to 1000, not zero"))),
+        _ => Err(bad(CMD, format!("{key}: give one of `force`, `moment` and `pressure`"))),
+    }
+}
+
 fn design(s: &mut Session, p: &Value) -> Result<Value> {
     let q: GenerativeDesignParams = serde_json::from_value(p.clone()).map_err(|e| bad(CMD, e.to_string()))?;
-    if q.held.is_empty() || q.load.is_empty() {
-        return Err(bad(CMD, "give at least one `held` face and one `load` face"));
-    }
-    if q.held.len() > 64 || q.load.len() > 64 {
-        return Err(bad(CMD, "at most 64 `held` and 64 `load` faces"));
-    }
-    let newtons = |f: V3| f.iter().map(|c| c * c).sum::<f64>().sqrt();
-    let force = v3(q.force.0);
-    if !(newtons(force) > 1e-6 && newtons(force) < 1e7) {
-        return Err(bad(CMD, "`force` must be a vector in newtons, not zero"));
-    }
+    let (slide, pin) = (q.slide.as_deref().unwrap_or(&[]), q.pin.as_deref().unwrap_or(&[]));
     let further = q.loads.as_deref().unwrap_or(&[]);
+    if q.held.is_empty() && slide.is_empty() && pin.is_empty() {
+        return Err(bad(CMD, "give at least one face that is held: `held`, `slide` or `pin`"));
+    }
+    if q.load.is_empty() && further.is_empty() {
+        return Err(bad(CMD, "give at least one load: `load` faces with a `force`, or `loads`"));
+    }
+    if q.held.len() > 64 || slide.len() > 64 || pin.len() > 64 || q.load.len() > 64 {
+        return Err(bad(CMD, "at most 64 faces each in `held`, `slide`, `pin` and `load`"));
+    }
     if further.len() > 8 || further.iter().any(|l| l.faces.is_empty() || l.faces.len() > 64) {
         return Err(bad(CMD, "`loads`: at most 8, each with 1 to 64 faces"));
     }
-    if further.iter().any(|l| !(newtons(v3(l.force.0)) > 1e-6 && newtons(v3(l.force.0)) < 1e7)) {
-        return Err(bad(CMD, "`loads`: each `force` must be a vector in newtons, not zero"));
-    }
     if further.iter().any(|l| l.case.is_some_and(|c| !(1..=8).contains(&c))) {
         return Err(bad(CMD, "`loads`: each `case` must be a number from 1 to 8"));
+    }
+    // Every load with its faces and its case counted from 0, the case of `load`.
+    let mut wanted: Vec<(&[GenerativeFace], Action, usize)> = Vec::new();
+    if !q.load.is_empty() {
+        wanted.push((&q.load, action(q.force.as_ref(), q.moment.as_ref(), q.pressure, "`load`")?, 0));
+    } else if q.force.is_some() || q.moment.is_some() || q.pressure.is_some() {
+        return Err(bad(CMD, "`force`, `moment` and `pressure` act on the `load` faces: give them"));
+    }
+    for l in further {
+        let case = l.case.map_or(0, |c| c.saturating_sub(1) as usize);
+        wanted.push((&l.faces, action(l.force.as_ref(), l.moment.as_ref(), l.pressure, "`loads`")?, case));
+    }
+    // The study's first load is in its case 0: with no `load`, the first of `loads` is the
+    // first, and its case changes places with case 1.
+    let first = wanted.first().map_or(0, |w| w.2);
+    for w in &mut wanted {
+        w.2 = match w.2 {
+            c if c == first => 0,
+            0 => first,
+            c => c,
+        };
     }
     let style = match q.style.as_deref().unwrap_or(gv::STYLE_ORGANIC) {
         gv::STYLE_ORGANIC => Style::Organic,
@@ -178,14 +217,19 @@ fn design(s: &mut Session, p: &Value) -> Result<Value> {
     };
 
     let st = s.model.state();
-    let held: Vec<Picked> = q.held.iter().map(|f| pick(s, &st, f, "held")).collect::<Result<_>>()?;
-    let load: Vec<Picked> = q.load.iter().map(|f| pick(s, &st, f, "load")).collect::<Result<_>>()?;
-    // The load's case counted from 0, the case of `load`.
-    let mut more: Vec<(Vec<Picked>, V3, usize)> = Vec::new();
-    for l in further {
-        let case = l.case.map_or(0, |c| c.saturating_sub(1) as usize);
-        more.push((l.faces.iter().map(|f| pick(s, &st, f, "loads")).collect::<Result<_>>()?, v3(l.force.0), case));
+    let picks = |faces: &[GenerativeFace], key: &str| -> Result<Vec<Picked>> { faces.iter().map(|f| pick(s, &st, f, key)).collect() };
+    let held = picks(&q.held, "held")?;
+    let slide = picks(slide, "slide")?;
+    let pin = picks(pin, "pin")?;
+    let mut loads: Vec<(Vec<Picked>, Action, usize)> = Vec::new();
+    for (faces, action, case) in &wanted {
+        loads.push((picks(faces, if loads.is_empty() && !q.load.is_empty() { "load" } else { "loads" })?, *action, *case));
     }
+    let mut loads = loads.into_iter();
+    let Some((load, first_action, _)) = loads.next() else { return Err(bad(CMD, "give at least one load")) };
+    let more: Vec<(Vec<Picked>, Action, usize)> = loads.collect();
+    // Springs hold a face that slides or turns, and those the built-in solver computes.
+    let guided = !slide.is_empty() || !pin.is_empty();
     let space = match q.space.as_deref().filter(|n| !n.trim().is_empty()) {
         Some(n) => Some(s.own_body_name(n).ok_or_else(|| bad(CMD, format!("`space`: no body `{n}`")))?),
         None => None,
@@ -194,7 +238,7 @@ fn design(s: &mut Session, p: &Value) -> Result<Value> {
     // out of one body) and the ones to avoid.
     let mut obstacles: Vec<String> = Vec::new();
     if space.is_none() {
-        obstacles.extend(held.iter().chain(&load).chain(more.iter().flat_map(|l| &l.0)).map(|f| f.body.clone()));
+        obstacles.extend(held.iter().chain(&slide).chain(&pin).chain(&load).chain(more.iter().flat_map(|l| &l.0)).map(|f| f.body.clone()));
     }
     obstacles.sort();
     obstacles.dedup();
@@ -213,9 +257,11 @@ fn design(s: &mut Session, p: &Value) -> Result<Value> {
     };
     let study = Study {
         held: held.into_iter().map(|f| f.tris).collect(),
+        slide: slide.into_iter().map(|f| f.tris).collect(),
+        pin: pin.into_iter().map(|f| f.tris).collect(),
         load: load.into_iter().map(|f| f.tris).collect(),
-        force,
-        more: more.into_iter().map(|(faces, force, case)| (faces.into_iter().map(|f| f.tris).collect(), force, case)).collect(),
+        action: first_action,
+        more: more.into_iter().map(|(faces, action, case)| (faces.into_iter().map(|f| f.tris).collect(), action, case)).collect(),
         space,
         obstacles: obstacles.iter().filter_map(|n| body_mesh(&st, n)).collect(),
         avoid: avoid.iter().filter_map(|n| body_mesh(&st, n)).collect(),
@@ -236,11 +282,14 @@ fn design(s: &mut Session, p: &Value) -> Result<Value> {
         },
     };
     let began = web_time::Instant::now();
+    gv::set_clock(clock);
+    gv::take_solve_seconds();
     let Report { mesh, outcome, cell, cells } = study::run(&study, &mut || began.elapsed().as_secs_f64() < time).map_err(|e| bad(CMD, e))?;
     // A graphics card that failed on the way was dropped, and the CPU finished the work.
     let report = GenerativeDesignReport {
-        solver: gv::grid_solver_name().unwrap_or_else(|| "CPU".into()),
+        solver: gv::grid_solver_name().filter(|_| !guided).unwrap_or_else(|| "CPU".into()),
         seconds: began.elapsed().as_secs_f64(),
+        solving: gv::take_solve_seconds(),
         cells: cells as u64,
         cell,
         stress: outcome.stress,
@@ -358,6 +407,32 @@ mod tests {
         assert!(body.body.is_closed_mesh());
     }
 
+    /// A moment and a pressure are loads as a force is, a face may slide on what holds it, and
+    /// a hole may turn on its pin: the structure carries them, computed by the built-in solver.
+    #[test]
+    fn moments_pressures_and_guided_supports_are_carried() {
+        let mut s = wall_and_shelf();
+        let params = json!({"length": 5, "width": 40, "height": 20, "corner": [75, 0, 0], "operation": "new", "body_name": "Foot"});
+        s.execute("solid.box", &params).unwrap();
+        // Held on the wall and resting on the foot's inner side, which only holds along x; the
+        // shelf is turned about y and pressed on from below.
+        let shelf = json!([{"body": "Shelf", "point": [40, 20, 50]}]);
+        let params = json!({
+            "held": [{"body": "Wall", "point": [5, 20, 25]}],
+            "slide": [{"body": "Foot", "point": [75, 20, 10]}],
+            "load": shelf,
+            "moment": [0, 2, 0],
+            "loads": [{"faces": [{"body": "Shelf", "point": [20, 20, 52]}], "pressure": 0.2, "case": 2}],
+            "voxels": 4000,
+        });
+        let reply = s.execute("generative.design", &params).unwrap();
+        assert_eq!(reply["design"]["solver"], "CPU", "{reply}");
+        assert!(reply["design"]["stress"].as_f64().is_some_and(|stress| stress > 0.0 && stress.is_finite()), "{reply}");
+        assert!(reply["design"]["deflection"].as_f64().is_some_and(|d| d > 0.0 && d < 50.0), "{reply}");
+        let st = s.model.state();
+        assert!(st.bodies.iter().find(|b| b.name == "Generative").expect("the new body").body.is_closed_mesh());
+    }
+
     /// Normals that waver from corner to corner of a flat stretch come out alike, and the two
     /// sides of a crease keep their own.
     #[test]
@@ -388,6 +463,12 @@ mod tests {
             json!({"loads": [{"faces": [], "force": [0, 0, 1]}]}),
             json!({"loads": [{"faces": [{"body": "Shelf", "point": [40, 20, 50]}], "force": [0, 0, 1], "case": 9}]}),
             json!({"loads": [{"faces": [{"body": "Shelf", "point": [40, 20, 50]}], "force": [0, 0, 0]}]}),
+            json!({"loads": [{"faces": [{"body": "Shelf", "point": [40, 20, 50]}], "force": [0, 0, 1], "pressure": 1}]}),
+            json!({"loads": [{"faces": [{"body": "Shelf", "point": [40, 20, 50]}]}]}),
+            json!({"moment": [0, 1, 0]}),
+            json!({"pressure": 2000, "force": null}),
+            // A pin needs a round face.
+            json!({"pin": [{"body": "Wall", "point": [5, 20, 25]}], "held": []}),
         ] {
             assert!(s.execute("generative.design", &design(extra.clone())).is_err(), "{extra}");
             assert_eq!(s.doc.to_json(), before);
